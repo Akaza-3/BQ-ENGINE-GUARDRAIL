@@ -460,6 +460,13 @@ def review():
         recommendations = rewrite_json.get("recommendations", [])
         business_logic = rewrite_json.get("business_logic", {})
 
+
+        # -----------------------------
+        # Build GitHub comment
+        # -----------------------------
+        section = f"## `{change['path']}`\n\n"
+
+
         # -----------------------------
         # Dry run ONLY the optimized SQL
         # -----------------------------
@@ -470,11 +477,6 @@ def review():
         else:
             section += f"**Gemini Rewrite:** {rewrite_bytes:,} bytes scanned (${bytes_to_cost(rewrite_bytes):.6f})\n\n"
 
-
-        # -----------------------------
-        # Build GitHub comment
-        # -----------------------------
-        section = f"## `{change['path']}`\n\n"
 
         if old_bytes is not None:
             section += f"**Previous:** {old_bytes:,} bytes scanned (${bytes_to_cost(old_bytes):.6f})\n\n"
