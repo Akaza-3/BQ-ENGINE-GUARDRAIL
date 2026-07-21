@@ -472,12 +472,6 @@ def review():
         # -----------------------------
         rewrite_bytes, rewrite_ok = dry_run_bytes(optimized_sql)
 
-        if not rewrite_ok:
-            section += "**Gemini Rewrite:** ⚠️ dry-run failed — this SQL may be invalid, do not merge without manual review\n\n"
-        else:
-            section += f"**Gemini Rewrite:** {rewrite_bytes:,} bytes scanned (${bytes_to_cost(rewrite_bytes):.6f})\n\n"
-
-
         if old_bytes is not None:
             section += f"**Previous:** {old_bytes:,} bytes scanned (${bytes_to_cost(old_bytes):.6f})\n\n"
         section += f"**Current:** {new_bytes:,} bytes scanned (${bytes_to_cost(new_bytes):.6f})\n\n"
