@@ -98,12 +98,12 @@ def _file_exists_at(repo_dir, sha, path):
 
 def dry_run_bytes(sql_text: str) -> int:
     if not sql_text:
-        return 0
+        return 0, True
 
     sql_text = extract_sql(sql_text)
 
     if not sql_text.strip():
-        return 0
+        return 0, True
 
     try:
         job_config = bigquery.QueryJobConfig(
@@ -113,13 +113,22 @@ def dry_run_bytes(sql_text: str) -> int:
 
         job = bq_client.query(sql_text, job_config=job_config)
 
-        return job.total_bytes_processed
+        return job.total_bytes_processed, True
 
     except Exception as e:
         logger.exception(f"Dry run failed:\n{sql_text}")
         logger.exception(e)
 
-        return 0
+        return 0, False
+
+BYTES_PER_TB = 1024 ** 4
+COST_PER_TB_USD = 6.25
+
+
+def bytes_to_cost(num_bytes: int) -> float:
+    if not num_bytes:
+        return 0.0
+    return (num_bytes / BYTES_PER_TB) * COST_PER_TB_USD
 
 
 def _extract_tables(sql_text: str):
@@ -224,43 +233,65 @@ def find_existing_cache(display_name):
         logger.warning(f"Cache lookup failed ({e}), will attempt to create a new one")
     return None
 
+CACHE_STORAGE_USD_PER_MILLION_TOKENS_PER_HOUR = 1.00
+CACHE_WRITE_USD_PER_MILLION_TOKENS = 0.30   # billed once, at creation
+CACHE_READ_USD_PER_MILLION_TOKENS = 0.03    # billed per call that reuses it
+
+
+def cache_storage_cost_per_hour(token_count: int) -> float:
+    return (token_count / 1_000_000) * CACHE_STORAGE_USD_PER_MILLION_TOKENS_PER_HOUR
+
+
+def cache_write_cost(token_count: int) -> float:
+    return (token_count / 1_000_000) * CACHE_WRITE_USD_PER_MILLION_TOKENS
+
+
+def cache_read_cost(token_count: int) -> float:
+    return (token_count / 1_000_000) * CACHE_READ_USD_PER_MILLION_TOKENS
+
+def get_cache_token_count(cache_name: str) -> int:
+    """Fetch the real token count for a cache from the API, not our
+    rough len()//4 estimate — usageMetadata.totalTokenCount is exact."""
+    try:
+        cache = genai_client.caches.get(name=cache_name)
+        return cache.usage_metadata.total_token_count
+    except Exception as e:
+        logger.warning(f"Could not fetch cache token count: {e}")
+        return 0
 
 def get_or_create_cache(schema_manifest: str, beam_context: str):
     PROMPT_VERSION = "v1"
-    combined = (
-        PROMPT_VERSION
-        + schema_manifest
-        + "\n\n[DOWNSTREAM]\n"
-        + beam_context
-    )
-
-    cache_hash = hashlib.sha256(
-        combined.encode("utf-8")
-    ).hexdigest()[:12]
-
+    combined = PROMPT_VERSION + schema_manifest + "\n\n[DOWNSTREAM]\n" + beam_context
+    cache_hash = hashlib.sha256(combined.encode("utf-8")).hexdigest()[:12]
     display_name = f"grid-schema-{cache_hash}"
+
     existing = find_existing_cache(display_name)
     if existing:
-        logger.info(f"Reusing existing cache: {existing}")
-        return existing
+        token_count = get_cache_token_count(existing)
+        logger.info(
+            f"Reusing existing cache: {existing} | {token_count:,} tokens | "
+            f"storage: ${cache_storage_cost_per_hour(token_count):.6f}/hr | "
+            f"this read: ${cache_read_cost(token_count):.6f}"
+        )
+        return existing, token_count
 
-    
     approx_tokens = len(combined) // 4
     logger.info(f"No existing cache found. Creating new one, manifest ~{approx_tokens} tokens (~{len(combined)} chars)")
     try:
         cache = genai_client.caches.create(
             model="gemini-2.5-flash",
-            config={
-                "contents": [combined],
-                "ttl": "86400s",
-                "display_name": display_name,
-            },
+            config={"contents": [combined], "ttl": "86400s", "display_name": display_name},
         )
-        logger.info(f"Context cache created successfully: {cache.name}")
-        return cache.name
+        actual_tokens = cache.usage_metadata.total_token_count
+        logger.info(
+            f"Context cache created successfully: {cache.name} | actual size: {actual_tokens:,} tokens | "
+            f"write cost: ${cache_write_cost(actual_tokens):.6f} | "
+            f"storage: ${cache_storage_cost_per_hour(actual_tokens):.6f}/hr (${cache_storage_cost_per_hour(actual_tokens) * 24:.4f}/day)"
+        )
+        return cache.name, actual_tokens
     except Exception as e:
         logger.warning(f"Cache creation failed ({e}), falling back to inline context")
-        return None
+        return None, 0
 
 
 def ask_gemini_for_rewrite(old_sql: str, new_sql: str, cache_name, schema_manifest, beam_context, original_bytes: int) -> str:
@@ -386,7 +417,7 @@ def review():
         new_bytes = dry_run_bytes(change["new"])
 
         schema_manifest = build_schema_manifest(change["new"])
-        cache_name = get_or_create_cache(schema_manifest, beam_context)
+        cache_name, cache_token_count = get_or_create_cache(schema_manifest, beam_context)
 
         rewrite = ask_gemini_for_rewrite(
             change["old"],
@@ -416,7 +447,7 @@ def review():
             logger.error(f"JSON parse failed:\n{rewrite}")
             # Fallback: use original SQL
             rewrite_json = {
-                "optimized_sql": new_sql,
+                "optimized_sql": change["new"],
                 "business_logic": {"status": "FAIL", "reason": "Gemini JSON parse failed"},
                 "summary": "Fallback to original",
                 "changes": [],
@@ -432,7 +463,13 @@ def review():
         # -----------------------------
         # Dry run ONLY the optimized SQL
         # -----------------------------
-        rewrite_bytes = dry_run_bytes(optimized_sql)
+        rewrite_bytes, rewrite_ok = dry_run_bytes(optimized_sql)
+
+        if not rewrite_ok:
+            section += "**Gemini Rewrite:** ⚠️ dry-run failed — this SQL may be invalid, do not merge without manual review\n\n"
+        else:
+            section += f"**Gemini Rewrite:** {rewrite_bytes:,} bytes scanned (${bytes_to_cost(rewrite_bytes):.6f})\n\n"
+
 
         # -----------------------------
         # Build GitHub comment
@@ -440,10 +477,22 @@ def review():
         section = f"## `{change['path']}`\n\n"
 
         if old_bytes is not None:
-            section += f"**Previous:** {old_bytes:,} bytes scanned\n\n"
+            section += f"**Previous:** {old_bytes:,} bytes scanned (${bytes_to_cost(old_bytes):.6f})\n\n"
+        section += f"**Current:** {new_bytes:,} bytes scanned (${bytes_to_cost(new_bytes):.6f})\n\n"
+        section += f"**Gemini Rewrite:** {rewrite_bytes:,} bytes scanned (${bytes_to_cost(rewrite_bytes):.6f})\n\n"
 
-        section += f"**Current:** {new_bytes:,} bytes scanned\n\n"
-        section += f"**Gemini Rewrite:** {rewrite_bytes:,} bytes scanned\n\n"
+        savings_usd = bytes_to_cost(new_bytes) - bytes_to_cost(rewrite_bytes)
+        savings_pct = (1 - rewrite_bytes / new_bytes) * 100 if new_bytes else 0
+        section += f"**Savings:** ${savings_usd:.6f} ({savings_pct:.1f}% reduction)\n\n"
+
+        section += (
+            f"### Context Cache\n"
+            f"- Size: {cache_token_count:,} tokens\n"
+            f"- Storage cost: ${cache_storage_cost_per_hour(cache_token_count):.6f}/hr "
+            f"(${cache_storage_cost_per_hour(cache_token_count) * 24:.4f}/day if held for 24h)\n"
+            f"- Cost of this cached call: ${cache_read_cost(cache_token_count):.6f} "
+            f"(vs. ${(cache_token_count / 1_000_000) * 0.30:.6f} if sent inline, uncached)\n\n"
+        )
 
         section += "### Business Logic\n"
 
