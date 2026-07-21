@@ -413,8 +413,8 @@ def review():
 
     comment_sections = []
     for change in changed:
-        old_bytes = dry_run_bytes(change["old"]) if change["old"] else None
-        new_bytes = dry_run_bytes(change["new"])
+        old_bytes, old_ok = dry_run_bytes(change["old"]) if change["old"] else (None, True)
+        new_bytes, new_ok = dry_run_bytes(change["new"])
 
         schema_manifest = build_schema_manifest(change["new"])
         cache_name, cache_token_count = get_or_create_cache(schema_manifest, beam_context)
