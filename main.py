@@ -377,9 +377,12 @@ def ask_gemini_for_rewrite(old_sql: str, new_sql: str, cache_name, schema_manife
 - For "risks": scan the Beam consumer code for any column used in arithmetic,
     comparison, or type-sensitive operation where the SQL schema shows that column
     as STRING. Each such mismatch is a risk entry. If none found, return an empty list.
--- A column's output type is its INFORMATION_SCHEMA type UNLESS it is explicitly
-  CAST in the SELECT list itself. CAST appearances in WHERE clauses, ORDER BY
-  clauses, or window function arguments do NOT change the column's output type.
+    IMPORTANT: a column's output type is its INFORMATION_SCHEMA type UNLESS it is
+    explicitly CAST in the SELECT list itself. CAST in WHERE clauses, ORDER BY, or
+    window function arguments does NOT change the output type. Example:
+    `SELECT delinq_2yrs FROM t WHERE CAST(delinq_2yrs AS INT64) > 0` — delinq_2yrs
+    is still STRING when it reaches the Beam consumer. Flag any STRING column used
+    in arithmetic (+,-,*,/) or numeric comparison (>,<,>=,<=) as severity HIGH.
 
 **Input:**
 {schema_manifest}
