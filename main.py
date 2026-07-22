@@ -1047,7 +1047,7 @@ def clone_and_diff(repo_clone_url: str, before_sha: str, after_sha: str):
 def clone_all_sql(repo_clone_url: str, ref: str = "main"):
     """Every .sql under resources/sql at `ref`. No before/after diff."""
     tmp_dir = tempfile.mkdtemp()
-    run_git("clone", repo_clone_url, tmp_dir, cwd="/tmp")
+    run_git("clone", _authed_url(repo_clone_url), tmp_dir, cwd="/tmp")
 
     try:
         run_git("checkout", ref, cwd=tmp_dir)
@@ -1706,6 +1706,12 @@ def build_ui_report(branch: str, commit_message: str, changed_results: list,
         },
     }
 
+
+def _authed_url(url: str) -> str:
+    """Inject the token for private repos. Never logged, never returned."""
+    if GITHUB_TOKEN and url.startswith("https://github.com/"):
+        return url.replace("https://", f"https://x-access-token:{GITHUB_TOKEN}@", 1)
+    return url
 
 def upload_report(blob_name: str, ui_report: dict):
     try:
