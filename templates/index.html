@@ -85,7 +85,7 @@
         </div>
         <div>
           <h1 class="text-[15px] font-semibold tracking-tight text-slate-100">BQ DevOps Cost Guardrail</h1>
-          <p class="text-[11px] text-slate-500 mono">Release review · Vertex AI Gemini 1.5 Pro</p>
+          <p class="text-[11px] text-slate-500 mono">Release review · Vertex AI Gemini 2.5 Flash</p>
         </div>
       </div>
       <div class="flex items-center gap-2 text-[11px] text-slate-500 mono">
@@ -250,7 +250,7 @@ const pct  = n => Number(n).toFixed(1) + '%';
 const SQL_KEYWORDS = ['SELECT','FROM','JOIN','LEFT JOIN','INNER JOIN','ON','WHERE','AND','OR','GROUP BY','ORDER BY','LIMIT','AS','BETWEEN','CURRENT_DATE','DATE_SUB','INTERVAL','COUNT','SUM','AVG','DESC','ASC','HAVING','NOT','IN','IS','NULL','CASE','WHEN','THEN','ELSE','END'];
 
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
 function formatBytes(bytes) {
@@ -262,19 +262,23 @@ function formatBytes(bytes) {
     return `${bytes} B`;
 }
 
-function highlightSql(sql, highlightTokens) {
+function highlightSql(sql) {
   let out = escapeHtml(sql);
-  out = out.replace(/(&#39;[^&]*?&#39;)/g, '<span class="str">$1</span>');
+
+  const strs = [];
+  out = out.replace(/'[^']*'/g, m => {
+    strs.push(m);
+    return '\u0000' + String.fromCharCode(65 + strs.length - 1) + '\u0000';
+  });
+
   out = out.replace(/(`[^`]+`)/g, '<span class="str">$1</span>');
   const kwPattern = new RegExp('\\b(' + SQL_KEYWORDS.join('|').replace(/ /g, '\\s+') + ')\\b', 'gi');
   out = out.replace(kwPattern, m => '<span class="kw">' + m.toUpperCase() + '</span>');
   out = out.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="num">$1</span>');
-  if (highlightTokens) {
-    highlightTokens.forEach(t => {
-      const re = new RegExp('(' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'g');
-      out = out.replace(re, '<span class="add">$1</span>');
-    });
-  }
+
+  out = out.replace(/\u0000([A-Z])\u0000/g,
+    (_, ch) => '<span class="str">' + strs[ch.charCodeAt(0) - 65] + '</span>');
+
   return out;
 }
 
@@ -371,7 +375,7 @@ function renderBanner(d) {
         </div>
         <p class="text-[12px] text-slate-500">
           <span class="text-slate-300 font-medium">${m.total_queries_evaluated} queries</span> evaluated in this release ·
-          BigQuery dry run complete · Gemini 1.5 Pro context cache hit
+          BigQuery dry run complete · Gemini 2.5 Flash context cache hit
         </p>
       </div>
       <div class="flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-${statusColor}-500/10 border border-${statusColor}-500/40">
