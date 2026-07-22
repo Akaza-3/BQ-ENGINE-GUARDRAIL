@@ -73,9 +73,18 @@ def clone_and_diff(repo_clone_url: str, before_sha: str, after_sha: str):
 
     results = []
     for path in changed_sql:
-        old_content = run_git("show", f"{before_sha}:{path}", cwd=tmp_dir) \
-            if _file_exists_at(tmp_dir, before_sha, path) else None
-        new_content = run_git("show", f"{after_sha}:{path}", cwd=tmp_dir)
+        old_exists = _file_exists_at(tmp_dir, before_sha, path)
+        new_exists = _file_exists_at(tmp_dir, after_sha, path)
+
+        old_content = run_git("show", f"{before_sha}:{path}", cwd=tmp_dir) if old_exists else None
+        new_content = run_git("show", f"{after_sha}:{path}", cwd=tmp_dir) if new_exists else None
+
+        if new_content is None:
+            # File was deleted in this diff — nothing to review or
+            # optimize, skip it rather than crashing.
+            logger.info(f"Skipping {path}: deleted between {before_sha} and {after_sha}")
+            continue
+
         results.append({"path": path, "old": old_content, "new": new_content})
 
     beam_context = ""
