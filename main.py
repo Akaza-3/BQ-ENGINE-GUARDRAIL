@@ -375,19 +375,6 @@ def ask_gemini_for_rewrite(old_sql, new_sql, cache_name, schema_manifest, beam_c
   code references a field that does NOT appear in the query's SELECT
   list at all, that's a correctness bug (would cause a KeyError at
   runtime) — report it under "recommendations", do not silently add it.
-- For "risks": the Beam consumer for THIS SQL file is `{consumer_file}`.
-  Scan ALL functions in that file, including helper functions called
-  from the main processing function — not just the top-level entry point.
-  For each column accessed in arithmetic (+,-,*,/), numeric comparison
-  (>,<,>=,<=,!=), or type-sensitive operations anywhere in the file:
-  (1) find that column in the SQL SELECT list — if it appears without an
-  explicit CAST it keeps its INFORMATION_SCHEMA base type; CAST in WHERE/
-  ORDER BY/window functions does NOT change output type.
-  (2) look up the base type in INFORMATION_SCHEMA.
-  (3) if the type is STRING or BYTES, flag it HIGH severity.
-  Note: Python never implicitly converts types — `"5" > 2` raises TypeError
-  regardless of the string's contents, even if a WHERE CAST filter ensures
-  the values are numeric strings.
 
 **Input:**
 {schema_manifest}
@@ -481,6 +468,120 @@ def extract_sql(response_text: str) -> str:
         return match.group(1).strip()
 
     return response_text.strip()
+
+import ast
+
+def detect_type_risks(beam_dir_context: str, consumer_file: str, schema_manifest: str) -> list:
+    """Deterministic STRING-in-arithmetic detector. No LLM involved."""
+    # 1. Parse INFORMATION_SCHEMA types out of the manifest
+    types = dict(re.findall(r"^- (\w+) \((\w+)\)", schema_manifest, re.MULTILINE))
+
+    # 2. Pull the consumer file's source out of the concatenated beam context
+    m = re.search(rf"--- {re.escape(consumer_file)} ---\n(.*?)(?=\n--- |\Z)",
+                  beam_dir_context, re.DOTALL)
+    if not m:
+        return []
+
+    risks, seen = [], set()
+
+    class Visitor(ast.NodeVisitor):
+        def _cols(self, node):
+            """Find row["col"] subscripts anywhere in this expression."""
+            return [n.slice.value for n in ast.walk(node)
+                    if isinstance(n, ast.Subscript)
+                    and isinstance(n.slice, ast.Constant)
+                    and isinstance(n.slice.value, str)]
+
+        def _flag(self, node, kind):
+            for col in self._cols(node):
+                t = types.get(col)
+                if t in ("STRING", "BYTES") and col not in seen:
+                    seen.add(col)
+                    risks.append({
+                        "severity": "HIGH",
+                        "beam_file": consumer_file,
+                        "column": col,
+                        "issue": f"{col} is {t} in BigQuery but used in {kind} in Python",
+                        "detail": f"`{ast.unparse(node)}` raises TypeError — "
+                                  f"Python does not implicitly convert {t} to a number.",
+                        "fix": f"CAST({col} AS INT64/FLOAT64) in the SQL SELECT list, "
+                               f"or convert in Beam before use.",
+                    })
+
+        def visit_BinOp(self, node):
+            if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+                self._flag(node, "arithmetic")
+            self.generic_visit(node)
+
+        def visit_Compare(self, node):
+            if any(isinstance(o, (ast.Gt, ast.Lt, ast.GtE, ast.LtE)) for o in node.ops):
+                self._flag(node, "numeric comparison")
+            self.generic_visit(node)
+
+    try:
+        Visitor().visit(ast.parse(m.group(1)))
+    except SyntaxError:
+        logger.warning(f"Could not parse {consumer_file}")
+    return risks
+
+def validate_risks_with_gemini(candidates: list, optimized_sql: str,
+                               consumer_file: str, cache_name) -> list:
+    """AST found candidates; Gemini confirms each is a real runtime failure."""
+    if not candidates:
+        return []
+
+    prompt = f"""You are validating suspected type-mismatch bugs in a Beam pipeline.
+
+A static analyzer flagged these columns as STRING in BigQuery but used in
+numeric operations in `{consumer_file}`. Confirm or reject each one.
+
+**Candidates:**
+{json.dumps(candidates, indent=2)}
+
+**SQL that produces these rows:**
+{optimized_sql}
+
+The Beam consumer `{consumer_file}` is in your cached context.
+
+**For each candidate decide:**
+- CONFIRMED if the column reaches Python as STRING and the expression raises
+  TypeError. Note: CAST in a WHERE / ORDER BY / window function does NOT change
+  the output type — only an explicit CAST in the SELECT list does.
+- REJECTED only if the column IS explicitly CAST in the SELECT list, or the
+  expression cannot actually execute.
+
+Python never implicitly converts types: `"5" > 2` raises TypeError regardless
+of the string's contents.
+
+Return ONLY valid JSON — the confirmed risks, with `detail` and `fix` rewritten
+to be specific to this query. Return [] if all are rejected.
+
+[
+  {{
+    "severity": "HIGH",
+    "beam_file": "...",
+    "column": "...",
+    "issue": "...",
+    "detail": "...",
+    "fix": "..."
+  }}
+]
+"""
+    try:
+        cfg = {"temperature": 0}
+        if cache_name:
+            cfg["cached_content"] = cache_name
+        resp = genai_client.models.generate_content(
+            model="gemini-2.5-flash", contents=prompt, config=cfg
+        )
+        text = resp.text.strip()
+        text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+        validated = json.loads(text)
+        logger.info(f"Risk validation: {len(candidates)} candidates → {len(validated)} confirmed")
+        return validated
+    except Exception:
+        logger.exception("Risk validation failed, falling back to raw AST candidates")
+        return candidates   # fail open — never lose a real bug
 
 
 def post_github_comment(repo_owner: str, repo_name: str, commit_sha: str, body: str):
@@ -652,7 +753,10 @@ def review():
 
         savings_usd = bytes_to_cost(new_bytes) - bytes_to_cost(rewrite_bytes)
         savings_pct = (1 - rewrite_bytes / new_bytes) * 100 if new_bytes else 0
-        risks = rewrite_json.get("risks", [])
+        candidates = detect_type_risks(beam_context, consumer, schema_manifest)
+        validated = validate_risks_with_gemini(candidates, optimized_sql, consumer, cache_name)
+        risks = validated if validated else candidates 
+        logger.info(f"{consumer}: {len(candidates)} candidates, {len(validated)} confirmed")
 
         changed_results.append({
             "path": change["path"],
