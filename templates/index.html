@@ -42,7 +42,7 @@
     transition: max-height 420ms cubic-bezier(0.4, 0, 0.2, 1), opacity 260ms ease;
     opacity: 0;
   }
-  .accordion-body.open { max-height: 2400px; opacity: 1; }
+  .accordion-body.open { max-height: 3600px; opacity: 1; }
   .chev { transition: transform 280ms cubic-bezier(0.4, 0, 0.2, 1); }
   .chev.open { transform: rotate(180deg); }
   .bar-fill { transition: width 900ms cubic-bezier(0.22, 1, 0.36, 1); }
@@ -59,6 +59,17 @@
   ::-webkit-scrollbar-thumb:hover { background: #3a4658; }
   .fade-in { animation: fadeUp 500ms cubic-bezier(0.22, 1, 0.36, 1) both; }
   @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+
+  /* ── Risk panel ── */
+  .risk-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 360ms cubic-bezier(0.4, 0, 0.2, 1), opacity 240ms ease;
+    opacity: 0;
+  }
+  .risk-body.open { max-height: 1200px; opacity: 1; }
+  .risk-chev { transition: transform 280ms cubic-bezier(0.4, 0, 0.2, 1); }
+  .risk-chev.open { transform: rotate(180deg); }
 </style>
 </head>
 <body class="min-h-screen">
@@ -131,9 +142,6 @@
 <div id="toastHost" class="fixed bottom-6 right-6 space-y-2 z-50"></div>
 
 <script>
-/* ────────────────────────────────────────────────────────────
-   EMBEDDED PAYLOAD — mirrors GET /api/latest-release response
-   ──────────────────────────────────────────────────────────── */
 const RELEASE_DATA = {
   "release_id": "release-v2.4.1",
   "branch": "PR #142",
@@ -158,7 +166,17 @@ const RELEASE_DATA = {
       "individual_savings_percent": 94.2,
       "original_sql": "SELECT * FROM `prod_finance.transaction_ledger` t JOIN `prod_finance.user_profiles` u ON t.user_id = u.user_id",
       "optimized_sql": "SELECT t.txn_id, t.amount, t.user_id FROM `prod_finance.transaction_ledger` t JOIN `prod_finance.user_profiles` u ON t.user_id = u.user_id WHERE t.txn_date = CURRENT_DATE()",
-      "ai_explanation": "Applied partition date filter on `txn_date` and trimmed 12 unreferenced columns mapped in Dataflow Java classes."
+      "ai_explanation": "Applied partition date filter on `txn_date` and trimmed 12 unreferenced columns mapped in Dataflow Java classes.",
+      "risks": [
+        {
+          "severity": "HIGH",
+          "beam_file": "delinquency_alerts.py",
+          "column": "delinq_2yrs",
+          "issue": "String column compared as integer — TypeError at runtime",
+          "detail": "is_severe_delinquency() does row[\"delinq_2yrs\"] > 2. SELECT * passes delinq_2yrs as STRING from the raw loan table. Python 3 raises TypeError comparing str > int.",
+          "fix": "CAST(delinq_2yrs AS INT64) in the SQL SELECT, or cast in Beam: int(row[\"delinq_2yrs\"]) > 2"
+        }
+      ]
     },
     {
       "query_id": "q2",
@@ -172,7 +190,25 @@ const RELEASE_DATA = {
       "individual_savings_percent": 81.3,
       "original_sql": "SELECT user_id, COUNT(*) FROM `prod_finance.credit_score_audit` GROUP BY user_id",
       "optimized_sql": "SELECT user_id, COUNT(1) FROM `prod_finance.credit_score_audit` WHERE audit_year = 2026 GROUP BY 1",
-      "ai_explanation": "Introduced cluster filtering on `audit_year` to eliminate full table scanning."
+      "ai_explanation": "Introduced cluster filtering on `audit_year` to eliminate full table scanning.",
+      "risks": [
+        {
+          "severity": "HIGH",
+          "beam_file": "dashboard.py",
+          "column": "int_rate",
+          "issue": "String column multiplied as float — TypeError at runtime",
+          "detail": "format_dashboard_row() computes row[\"int_rate\"] * 0.01. The base CTE does l.* so int_rate is never CAST — arrives as STRING from the raw loan table.",
+          "fix": "CAST(int_rate AS FLOAT64) AS int_rate in the base CTE, or in Beam: float(row[\"int_rate\"]) * 0.01"
+        },
+        {
+          "severity": "MEDIUM",
+          "beam_file": "employer_concentration.py",
+          "column": "loan_amnt",
+          "issue": "String column multiplied as float — TypeError at runtime",
+          "detail": "format_employer_row() computes row[\"loan_amnt\"] * 1.05 for risk_weighted_exposure. employer_concentration.sql selects l.* without any CAST.",
+          "fix": "CAST(l.loan_amnt AS FLOAT64) AS loan_amnt in the SQL SELECT, or in Beam: float(row[\"loan_amnt\"]) * 1.05"
+        }
+      ]
     },
     {
       "query_id": "q3",
@@ -186,7 +222,17 @@ const RELEASE_DATA = {
       "individual_savings_percent": 96.0,
       "original_sql": "SELECT * FROM `prod_finance.monthly_settlements` WHERE status = 'PENDING'",
       "optimized_sql": "SELECT settlement_id, net_amt FROM `prod_finance.monthly_settlements` WHERE status = 'PENDING' AND settlement_date >= '2026-07-01'",
-      "ai_explanation": "Restructured WHERE clause to leverage table indexing and partition prune."
+      "ai_explanation": "Restructured WHERE clause to leverage table indexing and partition prune.",
+      "risks": [
+        {
+          "severity": "HIGH",
+          "beam_file": "watchlist.py",
+          "column": "out_prncp",
+          "issue": "STRING added to FLOAT64 — TypeError at runtime",
+          "detail": "format_watchlist_row() computes net_exposure = row[\"out_prncp\"] + row[\"total_outstanding\"]. out_prncp is STRING from b.*, total_outstanding is CAST FLOAT64 from the CTE. str + float raises TypeError.",
+          "fix": "CAST(out_prncp AS FLOAT64) AS out_prncp in the final SELECT"
+        }
+      ]
     }
   ],
   "context_verification": {
@@ -201,7 +247,6 @@ const usd0 = n => '$' + Math.round(n).toLocaleString('en-US');
 const usd2 = n => '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const pct  = n => Number(n).toFixed(1) + '%';
 
-/* ── Minimal SQL syntax highlighter ─────────────────────── */
 const SQL_KEYWORDS = ['SELECT','FROM','JOIN','LEFT JOIN','INNER JOIN','ON','WHERE','AND','OR','GROUP BY','ORDER BY','LIMIT','AS','BETWEEN','CURRENT_DATE','DATE_SUB','INTERVAL','COUNT','SUM','AVG','DESC','ASC','HAVING','NOT','IN','IS','NULL','CASE','WHEN','THEN','ELSE','END'];
 
 function escapeHtml(s) {
@@ -209,23 +254,11 @@ function escapeHtml(s) {
 }
 
 function formatBytes(bytes) {
-    const kb = 1024;
-    const mb = kb * 1024;
-    const gb = mb * 1024;
-    const tb = gb * 1024;
-
-    if (bytes >= tb)
-        return `${(bytes / tb).toFixed(2)} TB`;
-
-    if (bytes >= gb)
-        return `${(bytes / gb).toFixed(2)} GB`;
-
-    if (bytes >= mb)
-        return `${(bytes / mb).toFixed(2)} MB`;
-
-    if (bytes >= kb)
-        return `${(bytes / kb).toFixed(2)} KB`;
-
+    const kb = 1024, mb = kb*1024, gb = mb*1024, tb = gb*1024;
+    if (bytes >= tb) return `${(bytes/tb).toFixed(2)} TB`;
+    if (bytes >= gb) return `${(bytes/gb).toFixed(2)} GB`;
+    if (bytes >= mb) return `${(bytes/mb).toFixed(2)} MB`;
+    if (bytes >= kb) return `${(bytes/kb).toFixed(2)} KB`;
     return `${bytes} B`;
 }
 
@@ -246,37 +279,22 @@ function highlightSql(sql, highlightTokens) {
 }
 
 function formatCost(cost){
-    if(cost >= 1)
-        return `$${cost.toFixed(2)}`;
-
+    if(cost >= 1) return `$${cost.toFixed(2)}`;
     return `$${cost.toFixed(4)}`;
 }
 
 function getBadges(explanation){
     const text = explanation.toLowerCase();
     const badges = [];
-
-    if(text.includes("partition"))
-        badges.push("Partition Pruning");
-
-    if(text.includes("column"))
-        badges.push("Column Pruning");
-
-    if(text.includes("cluster"))
-        badges.push("Cluster Pruning");
-
-    if(text.includes("select *"))
-        badges.push("Removed SELECT *");
-
-    if(text.includes("filter"))
-        badges.push("Predicate Pushdown");
-
+    if(text.includes("partition")) badges.push("Partition Pruning");
+    if(text.includes("column")) badges.push("Column Pruning");
+    if(text.includes("cluster")) badges.push("Cluster Pruning");
+    if(text.includes("select *")) badges.push("Removed SELECT *");
+    if(text.includes("filter")) badges.push("Predicate Pushdown");
     badges.push("Context Verified");
-
     return badges;
 }
 
-/* Pretty-print flat SQL onto multiple lines for readability */
 function formatSql(sql) {
   return sql
     .replace(/\s+(FROM|WHERE|GROUP BY|ORDER BY|LIMIT|HAVING)\s+/gi, '\n$1 ')
@@ -284,6 +302,56 @@ function formatSql(sql) {
     .replace(/\s+(ON)\s+/gi, '\n  $1 ')
     .replace(/\s+(AND|OR)\s+/gi, '\n  $1 ')
     .trim();
+}
+
+/* ── Render: Risk panel ─────────────────────────────────── */
+function renderRisks(risks, queryId) {
+  if (!risks || risks.length === 0) return '';
+  const highCount = risks.filter(r => r.severity === 'HIGH').length;
+  const medCount  = risks.filter(r => r.severity === 'MEDIUM').length;
+
+  const rows = risks.map(r => {
+    const isHigh = r.severity === 'HIGH';
+    const c = isHigh ? 'red' : 'amber';
+    return `
+      <div class="rounded-lg border border-${c}-500/25 bg-${c}-500/[0.04] p-4">
+        <div class="flex items-center gap-2 mb-2">
+          <span class="mono text-[10px] px-2 py-0.5 rounded font-semibold bg-${c}-500/15 border border-${c}-500/30 text-${c}-400">${r.severity}</span>
+          <span class="mono text-[11px] text-slate-400">${escapeHtml(r.beam_file)}</span>
+          <span class="text-slate-700">·</span>
+          <span class="mono text-[11px] font-semibold text-${c}-300">${escapeHtml(r.column)}</span>
+        </div>
+        <p class="text-[12.5px] font-medium text-${c}-200 mb-1.5">${escapeHtml(r.issue)}</p>
+        <p class="text-[11.5px] text-slate-400 leading-relaxed mb-3">${escapeHtml(r.detail)}</p>
+        <div class="flex items-start gap-2 rounded-md bg-green-500/[0.06] border border-green-500/20 px-3 py-2">
+          <i data-lucide="wrench" class="w-3.5 h-3.5 text-green-400 mt-0.5 shrink-0"></i>
+          <span class="text-[11.5px] text-green-300 leading-relaxed">${escapeHtml(r.fix)}</span>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <button class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30
+                   hover:bg-amber-500/15 transition text-[12px] font-medium text-amber-300"
+            data-risk-toggle="${queryId}" onclick="toggleRisk(event,'${queryId}')">
+      <i data-lucide="triangle-alert" class="w-3.5 h-3.5 text-amber-400"></i>
+      ${risks.length} Risk${risks.length > 1 ? 's' : ''} Detected
+      <i data-lucide="chevron-down" class="w-3.5 h-3.5 text-amber-500 risk-chev" id="risk-chev-${queryId}"></i>
+    </button>
+
+    <div class="risk-body" id="risk-body-${queryId}">
+      <div class="rounded-xl border border-amber-500/20 bg-amber-500/[0.03] overflow-hidden mt-1">
+        <div class="px-4 py-3 border-b border-amber-500/15 flex items-center gap-2">
+          <i data-lucide="triangle-alert" class="w-4 h-4 text-amber-400"></i>
+          <span class="text-[11px] font-semibold text-amber-400 uppercase tracking-[0.09em]">
+            Beam pipeline risks · ${risks.length} type mismatch${risks.length > 1 ? 'es' : ''} detected
+          </span>
+          ${highCount > 0 ? `<span class="mono text-[10px] px-2 py-0.5 rounded bg-red-500/15 border border-red-500/30 text-red-400 ml-auto">${highCount} HIGH</span>` : ''}
+          ${medCount  > 0 ? `<span class="mono text-[10px] px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-400 ${highCount ? '' : 'ml-auto'}">${medCount} MEDIUM</span>` : ''}
+        </div>
+        <div class="p-4 space-y-3">${rows}</div>
+      </div>
+    </div>`;
 }
 
 /* ── Render: Executive Banner ───────────────────────────── */
@@ -324,7 +392,6 @@ function renderBanner(d) {
         <div class="mono text-[26px] font-semibold text-red-400 leading-none">${usd0(m.annual_original_cost_usd)}</div>
         <div class="text-[11px] text-slate-600 mt-1.5">unoptimized · per year</div>
       </div>
-
       <div class="px-6 py-5">
         <div class="flex items-center gap-1.5 mb-2">
           <i data-lucide="sparkles" class="w-3.5 h-3.5 text-green-400"></i>
@@ -333,7 +400,6 @@ function renderBanner(d) {
         <div class="mono text-[26px] font-semibold text-green-400 leading-none">${usd0(m.annual_optimized_cost_usd)}</div>
         <div class="text-[11px] text-slate-600 mt-1.5">post-Gemini rewrite · per year</div>
       </div>
-
       <div class="px-6 py-5">
         <div class="flex items-center gap-1.5 mb-2">
           <i data-lucide="piggy-bank" class="w-3.5 h-3.5 text-sky-400"></i>
@@ -342,7 +408,6 @@ function renderBanner(d) {
         <div class="mono text-[26px] font-semibold text-sky-400 leading-none">${usd0(m.net_annual_savings_usd)}</div>
         <div class="text-[11px] text-slate-600 mt-1.5">${usd0(m.net_annual_savings_usd / 12)} / Estimated Monthly Savings</div>
       </div>
-
       <div class="px-6 py-5 bg-green-500/[0.04]">
         <div class="flex items-center gap-1.5 mb-2">
           <i data-lucide="badge-percent" class="w-3.5 h-3.5 text-green-400"></i>
@@ -364,6 +429,7 @@ function renderQueries(queries) {
     const annualOrig = q.original_cost_per_run * q.runs_per_day * 365;
     const annualOpt  = q.optimized_cost_per_run * q.runs_per_day * 365;
     const tbRatio = (q.optimized_bytes_scanned / q.original_bytes_scanned) * 100;
+    const risks = q.risks || [];
     return `
     <div class="panel rounded-xl overflow-hidden card-hover fade-in" style="animation-delay:${i * 70}ms">
 
@@ -385,6 +451,11 @@ function renderQueries(queries) {
         </div>
 
         <div class="flex items-center gap-5 sm:gap-7">
+          ${risks.length > 0 ? `
+          <div class="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-500/10 border border-amber-500/30">
+            <i data-lucide="triangle-alert" class="w-3 h-3 text-amber-400"></i>
+            <span class="mono text-[11px] font-semibold text-amber-400">${risks.length} Risk${risks.length > 1 ? 's' : ''}</span>
+          </div>` : ''}
           <div class="text-right">
             <div class="text-[10px] uppercase tracking-wider text-slate-600 mb-0.5">Original / yr</div>
             <div class="mono text-[14px] font-medium text-red-400">${usd0(annualOrig)}</div>
@@ -433,6 +504,9 @@ function renderQueries(queries) {
             </div>
           </div>
 
+          <!-- Risk panel -->
+          ${renderRisks(risks, q.query_id)}
+
           <!-- Side-by-side SQL diff -->
           <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
             <div class="sunken rounded-lg overflow-hidden">
@@ -447,7 +521,6 @@ function renderQueries(queries) {
                 <pre class="mono text-[11.5px] leading-[1.75] text-slate-300">${highlightSql(formatSql(q.original_sql))}</pre>
               </div>
             </div>
-
             <div class="sunken rounded-lg overflow-hidden">
               <div class="px-3.5 py-2 border-b border-[#1e2836] flex items-center justify-between bg-green-500/[0.04]">
                 <div class="flex items-center gap-2">
@@ -470,13 +543,9 @@ function renderQueries(queries) {
             </div>
             <p class="text-[12.5px] leading-relaxed text-green-200/80">${escapeHtml(q.ai_explanation)}</p>
             <div class="flex flex-wrap gap-2 mt-3">
-                ${getBadges(q.ai_explanation).map(badge => `
-                    <span class="mono text-[10px] px-2 py-1 rounded
-                        bg-green-500/10 border border-green-500/20
-                        text-green-400">
-                        ${badge}
-                    </span>
-                `).join("")}
+              ${getBadges(q.ai_explanation).map(badge => `
+                <span class="mono text-[10px] px-2 py-1 rounded bg-green-500/10 border border-green-500/20 text-green-400">${badge}</span>
+              `).join("")}
             </div>
           </div>
 
@@ -495,11 +564,10 @@ function renderContextFooter(cv) {
       storage_cost_per_hour: 0
   };
   const items = [
-    { icon: 'database',   label: 'BigQuery schemas checked',   value: cv.bq_schemas_checked,        note: 'Partition + cluster metadata resolved' },
-    { icon: 'file-json',  label: 'Avro mappings matched',      value: cv.avro_mappings_matched,     note: 'No downstream schema breakage detected' },
-    { icon: 'file-code',  label: 'Dataflow logic validated',   value: cv.dataflow_logic_validated,  note: 'Column references cross-checked in Java' },
-    {icon: 'brain-circuit',label: 'Vertex AI Context Cache', value: `${cache.status} • ${cache.token_count.toLocaleString()} tokens`, note: `Read: $${cache.read_cost.toFixed(6)} · Storage: $${cache.storage_cost_per_hour.toFixed(6)}/hr`
-    }
+    { icon: 'database',     label: 'BigQuery schemas checked',  value: cv.bq_schemas_checked,       note: 'Partition + cluster metadata resolved' },
+    { icon: 'file-json',    label: 'Avro mappings matched',     value: cv.avro_mappings_matched,    note: 'No downstream schema breakage detected' },
+    { icon: 'file-code',    label: 'Dataflow logic validated',  value: cv.dataflow_logic_validated, note: 'Column references cross-checked in Java' },
+    { icon: 'brain-circuit',label: 'Vertex AI Context Cache',   value: `${cache.status} • ${cache.token_count.toLocaleString()} tokens`, note: `Read: $${cache.read_cost.toFixed(6)} · Storage: $${cache.storage_cost_per_hour.toFixed(6)}/hr` }
   ];
 
   document.getElementById('contextFooter').innerHTML = `
@@ -510,7 +578,7 @@ function renderContextFooter(cv) {
         <span class="mono text-[10px] px-2 py-0.5 rounded bg-sky-500/10 border border-sky-500/25 text-sky-400 ml-1">
             ${cache.status} · ${cache.token_count.toLocaleString()} tokens
         </span>
-        </div>
+      </div>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
         ${items.map(it => `
           <div class="sunken rounded-lg p-4">
@@ -532,6 +600,17 @@ function renderContextFooter(cv) {
       </div>
     </div>
   `;
+}
+
+/* ── Toggle risk panel ──────────────────────────────────── */
+function toggleRisk(e, queryId) {
+  e.stopPropagation();
+  const body = document.getElementById(`risk-body-${queryId}`);
+  const chev = document.getElementById(`risk-chev-${queryId}`);
+  const opening = !body.classList.contains('open');
+  body.classList.toggle('open', opening);
+  chev.classList.toggle('open', opening);
+  if (opening && window.lucide) lucide.createIcons();
 }
 
 /* ── Accordion wiring ───────────────────────────────────── */
@@ -556,10 +635,12 @@ function wireAccordions() {
   document.getElementById('collapseAll').addEventListener('click', () => {
     document.querySelectorAll('.accordion-body').forEach(b => b.classList.remove('open'));
     document.querySelectorAll('.chev').forEach(c => c.classList.remove('open'));
+    document.querySelectorAll('.risk-body').forEach(b => b.classList.remove('open'));
+    document.querySelectorAll('.risk-chev').forEach(c => c.classList.remove('open'));
   });
 }
 
-/* ── Animate progress bars to their data-target width ───── */
+/* ── Animate progress bars ──────────────────────────────── */
 function animateBars() {
   document.querySelectorAll('.bar-fill[data-target]').forEach(bar => {
     const t = Math.min(100, Math.max(0, parseFloat(bar.getAttribute('data-target')) || 0));
@@ -604,14 +685,13 @@ function rerunAnalysis() {
 document.addEventListener('DOMContentLoaded', async () => {
   let data = RELEASE_DATA;
 
-  // Prefer live backend when served by FastAPI; fall back to embedded payload.
   try {
     const res = await fetch('/api/latest-report', { cache: 'no-store' });
     if (res.ok) {
       const live = await res.json();
       if (live && live.queries && live.queries.length) data = live;
     }
-  } catch (_) { /* offline / standalone file — embedded payload is used */ }
+  } catch (_) {}
 
   renderBanner(data);
   renderQueries(data.queries);
@@ -620,7 +700,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (window.lucide) lucide.createIcons();
 
-  // Open the first (highest-impact) query by default for the demo.
   const first = data.queries[0];
   if (first) {
     document.querySelector(`[data-body="${first.query_id}"]`)?.classList.add('open');

@@ -374,6 +374,9 @@ def ask_gemini_for_rewrite(old_sql: str, new_sql: str, cache_name, schema_manife
   code references a field that does NOT appear in the query's SELECT
   list at all, that's a correctness bug (would cause a KeyError at
   runtime) — report it under "recommendations", do not silently add it.
+- For "risks": scan the Beam consumer code for any column used in arithmetic,
+    comparison, or type-sensitive operation where the SQL schema shows that column
+    as STRING. Each such mismatch is a risk entry. If none found, return an empty list.
 
 **Input:**
 {schema_manifest}
@@ -398,6 +401,16 @@ Return **ONLY** valid JSON (no markdown, no extra text):
   "summary": "One sentence summary of changes",
   "changes": [
     {{"change": "Removed unused column X", "reason": "Not used by Beam pipeline"}}
+  ],
+  "risks": [
+    {{
+      "severity": "HIGH",
+      "beam_file": "filename.py",
+      "column": "column_name",
+      "issue": "One-line description of the type mismatch",
+      "detail": "Exact expression that fails and why",
+      "fix": "Suggested fix in SQL or Beam"
+    }}
   ],
   "recommendations": ["List of further suggestions for human review"]
 }}
@@ -503,6 +516,7 @@ def build_ui_report(branch: str, commit_message: str, changed_results: list, bea
             "original_sql": r["new_sql"],
             "optimized_sql": r["optimized_sql"],
             "ai_explanation": r["summary"],
+            "risks": r.get("risks", []),
         })
         all_business_logic.append(r["business_logic"])
 
@@ -526,6 +540,7 @@ def build_ui_report(branch: str, commit_message: str, changed_results: list, bea
             "net_annual_savings_usd": round(net_savings, 2),
             "savings_percentage": round(savings_pct, 1),
         },
+        "queries": queries,
         "context_verification": {
             "bq_schemas_checked": bq_schemas_checked,
             "avro_mappings_matched": "N/A — no Avro schema in this pipeline",
@@ -599,6 +614,7 @@ def review():
                 "business_logic": {"status": "FAIL", "reason": "Gemini JSON parse failed"},
                 "summary": "Fallback to original",
                 "changes": [],
+                "risks": [],
                 "recommendations": []
             }
 
@@ -615,6 +631,7 @@ def review():
 
         savings_usd = bytes_to_cost(new_bytes) - bytes_to_cost(rewrite_bytes)
         savings_pct = (1 - rewrite_bytes / new_bytes) * 100 if new_bytes else 0
+        risks = rewrite_json.get("risks", [])
 
         changed_results.append({
             "path": change["path"],
@@ -626,6 +643,7 @@ def review():
             "optimized_sql": optimized_sql,
             "summary": summary,
             "business_logic": business_logic,
+            "risks": risks, 
         })
 
         # -----------------------------
