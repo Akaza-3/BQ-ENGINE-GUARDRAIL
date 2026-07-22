@@ -70,7 +70,9 @@ QUERY_RUNTIME_CONFIG = {
     "resources/sql/customer_risk_dashboard.sql": {"dag_task_id": "risk_dashboard_hourly", "runs_per_day": 7, "beam_consumer": "dashboard.py"},
     "resources/sql/delinquency_alerts.sql": {"dag_task_id": "delinquency_scan", "runs_per_day": 12, "beam_consumer": "delinquency_alerts.py"},
     "resources/sql/employer_concentration.sql": {"dag_task_id": "employer_concentration_weekly", "runs_per_day": 1, "beam_consumer": "employer_concentration.py"},
-    "resources/sql/high_risk_watchlist.sql": {"dag_task_id": "risk_watchlist","runs_per_day":3, "beam_consumer": "watchlist.py"}
+    "resources/sql/high_risk_watchlist.sql": {"dag_task_id": "risk_watchlist","runs_per_day":3, "beam_consumer": "watchlist.py"},
+    "resources/sql/portfolio_stress_test.sql": {"dag_task_id": "portfolio_stress_quarterly", "runs_per_day": 8, "beam_consumer": "stress_test.py",
+},
 }
 DEFAULT_RUNTIME_CONFIG = {"dag_task_id": "unscheduled", "runs_per_day": 1}
 
