@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BQ DevOps Cost Guardrail — Release Review</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+<style>
+  :root {
+    --bg-base: #0a0e17;
+    --bg-panel: #121824;
+    --bg-sunken: #0d1420;
+    --border-hair: #1e2836;
+    --border-soft: #2a3648;
+  }
+  body {
+    background: var(--bg-base);
+    color: #e2e8f0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', Consolas, monospace; }
+  .panel { background: var(--bg-panel); border: 1px solid var(--border-hair); }
+  .sunken { background: var(--bg-sunken); border: 1px solid var(--border-hair); }
+  .grid-bg {
+    background-image:
+      linear-gradient(rgba(56,189,248,0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(56,189,248,0.035) 1px, transparent 1px);
+    background-size: 44px 44px;
+  }
+  .kw  { color: #f472b6; }
+  .fn  { color: #c084fc; }
+  .str { color: #7dd3fc; }
+  .num { color: #fbbf24; }
+  .cm  { color: #64748b; font-style: italic; }
+  .add { color: #4ade80; font-weight: 500; }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+  .accordion-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 420ms cubic-bezier(0.4, 0, 0.2, 1), opacity 260ms ease;
+    opacity: 0;
+  }
+  .accordion-body.open { max-height: 2400px; opacity: 1; }
+  .chev { transition: transform 280ms cubic-bezier(0.4, 0, 0.2, 1); }
+  .chev.open { transform: rotate(180deg); }
+  .bar-fill { transition: width 900ms cubic-bezier(0.22, 1, 0.36, 1); }
+  .pulse-dot { animation: pulse-ring 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+  @keyframes pulse-ring {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(74,222,128,0.5); }
+    50%      { box-shadow: 0 0 0 6px rgba(74,222,128,0); }
+  }
+  .card-hover { transition: border-color 200ms ease, background 200ms ease; }
+  .card-hover:hover { border-color: var(--border-soft); }
+  ::-webkit-scrollbar { height: 8px; width: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2a3648; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3a4658; }
+  .fade-in { animation: fadeUp 500ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+</style>
+</head>
+<body class="min-h-screen">
+
+<div class="grid-bg min-h-screen">
+  <div class="max-w-[1400px] mx-auto px-6 py-6">
+
+    <!-- ══ TOP NAV STRIP ══ -->
+    <div class="flex items-center justify-between mb-5">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-lg bg-sky-500/10 border border-sky-500/30 flex items-center justify-center">
+          <i data-lucide="shield-check" class="w-5 h-5 text-sky-400"></i>
+        </div>
+        <div>
+          <h1 class="text-[15px] font-semibold tracking-tight text-slate-100">BQ DevOps Cost Guardrail</h1>
+          <p class="text-[11px] text-slate-500 mono">Release review · Vertex AI Gemini 1.5 Pro</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2 text-[11px] text-slate-500 mono">
+        <span class="w-1.5 h-1.5 rounded-full bg-green-400 pulse-dot"></span>
+        <span id="liveClock">Connected</span>
+      </div>
+    </div>
+
+    <!-- ══ EXECUTIVE BANNER ══ -->
+    <div id="execBanner" class="panel rounded-2xl overflow-hidden mb-5"></div>
+
+    <!-- ══ SECTION LABEL ══ -->
+    <div class="flex items-center justify-between mb-3 px-1">
+      <div class="flex items-center gap-2">
+        <i data-lucide="file-code-2" class="w-4 h-4 text-slate-500"></i>
+        <h2 class="text-[12px] font-medium uppercase tracking-[0.1em] text-slate-400">Modified query files in release</h2>
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="expandAll" class="text-[11px] mono px-3 py-1.5 rounded-md border border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-600 transition">Expand all</button>
+        <button id="collapseAll" class="text-[11px] mono px-3 py-1.5 rounded-md border border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-600 transition">Collapse all</button>
+      </div>
+    </div>
+
+    <!-- ══ QUERY CARDS ══ -->
+    <div id="queryList" class="space-y-3 mb-5"></div>
+
+    <!-- ══ CONTEXT VERIFICATION FOOTER ══ -->
+    <div id="contextFooter" class="mb-5"></div>
+
+    <!-- ══ ACTION BAR ══ -->
+    <div class="panel rounded-2xl p-4 flex flex-wrap items-center gap-3">
+      <button onclick="approveRelease()" class="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-green-600 hover:bg-green-500 text-white text-[13px] font-medium transition active:scale-[0.98]">
+        <i data-lucide="git-merge" class="w-4 h-4"></i>
+        Approve &amp; merge release
+      </button>
+      <button onclick="downloadReport()" class="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[13px] font-medium transition active:scale-[0.98]">
+        <i data-lucide="file-down" class="w-4 h-4"></i>
+        Download PO cost audit report (PDF)
+      </button>
+      <button onclick="rerunAnalysis()" class="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[13px] font-medium transition active:scale-[0.98]">
+        <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+        Re-run dry run analysis
+      </button>
+      <div class="ml-auto text-[11px] text-slate-600 mono" id="footerStamp"></div>
+    </div>
+
+    <p class="text-[10px] text-slate-700 mono text-center mt-6">
+      Internal hackathon demo · BigQuery dry-run pricing at $6.25/TB (on-demand) · Figures are estimates, not billed amounts
+    </p>
+  </div>
+</div>
+
+<!-- ══ TOAST HOST ══ -->
+<div id="toastHost" class="fixed bottom-6 right-6 space-y-2 z-50"></div>
+
+<script>
+/* ────────────────────────────────────────────────────────────
+   EMBEDDED PAYLOAD — mirrors GET /api/latest-release response
+   ──────────────────────────────────────────────────────────── */
+const RELEASE_DATA = {
+  "release_id": "release-v2.4.1",
+  "branch": "PR #142",
+  "guardrail_status": "PASSED GUARDRAIL",
+  "summary_metrics": {
+    "total_queries_evaluated": 3,
+    "annual_original_cost_usd": 268500,
+    "annual_optimized_cost_usd": 22700,
+    "net_annual_savings_usd": 245800,
+    "savings_percentage": 91.5
+  },
+  "queries": [
+    {
+      "query_id": "q1",
+      "file_name": "01_daily_transaction_ledger.sql",
+      "dag_task_id": "stage_txn_ledger",
+      "runs_per_day": 10,
+      "original_tb_scanned": 22.8,
+      "original_cost_per_run": 142.50,
+      "optimized_tb_scanned": 1.3,
+      "optimized_cost_per_run": 8.20,
+      "individual_savings_percent": 94.2,
+      "original_sql": "SELECT * FROM `prod_finance.transaction_ledger` t JOIN `prod_finance.user_profiles` u ON t.user_id = u.user_id",
+      "optimized_sql": "SELECT t.txn_id, t.amount, t.user_id FROM `prod_finance.transaction_ledger` t JOIN `prod_finance.user_profiles` u ON t.user_id = u.user_id WHERE t.txn_date = CURRENT_DATE()",
+      "ai_explanation": "Applied partition date filter on `txn_date` and trimmed 12 unreferenced columns mapped in Dataflow Java classes."
+    },
+    {
+      "query_id": "q2",
+      "file_name": "02_customer_risk_aggregation.sql",
+      "dag_task_id": "calc_risk_score",
+      "runs_per_day": 4,
+      "original_tb_scanned": 10.4,
+      "original_cost_per_run": 65.00,
+      "optimized_tb_scanned": 1.9,
+      "optimized_cost_per_run": 12.10,
+      "individual_savings_percent": 81.3,
+      "original_sql": "SELECT user_id, COUNT(*) FROM `prod_finance.credit_score_audit` GROUP BY user_id",
+      "optimized_sql": "SELECT user_id, COUNT(1) FROM `prod_finance.credit_score_audit` WHERE audit_year = 2026 GROUP BY 1",
+      "ai_explanation": "Introduced cluster filtering on `audit_year` to eliminate full table scanning."
+    },
+    {
+      "query_id": "q3",
+      "file_name": "03_monthly_settlement_join.sql",
+      "dag_task_id": "settlement_reconcile",
+      "runs_per_day": 1,
+      "original_tb_scanned": 9.7,
+      "original_cost_per_run": 61.00,
+      "optimized_tb_scanned": 0.38,
+      "optimized_cost_per_run": 2.40,
+      "individual_savings_percent": 96.0,
+      "original_sql": "SELECT * FROM `prod_finance.monthly_settlements` WHERE status = 'PENDING'",
+      "optimized_sql": "SELECT settlement_id, net_amt FROM `prod_finance.monthly_settlements` WHERE status = 'PENDING' AND settlement_date >= '2026-07-01'",
+      "ai_explanation": "Restructured WHERE clause to leverage table indexing and partition prune."
+    }
+  ],
+  "context_verification": {
+    "bq_schemas_checked": "prod_finance (3 Tables)",
+    "avro_mappings_matched": "txn_payload_v2.avsc (52 Fields)",
+    "dataflow_logic_validated": "TransactionTransformer.java"
+  }
+};
+
+/* ── Formatters ─────────────────────────────────────────── */
+const usd0 = n => '$' + Math.round(n).toLocaleString('en-US');
+const usd2 = n => '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const pct  = n => Number(n).toFixed(1) + '%';
+
+/* ── Minimal SQL syntax highlighter ─────────────────────── */
+const SQL_KEYWORDS = ['SELECT','FROM','JOIN','LEFT JOIN','INNER JOIN','ON','WHERE','AND','OR','GROUP BY','ORDER BY','LIMIT','AS','BETWEEN','CURRENT_DATE','DATE_SUB','INTERVAL','COUNT','SUM','AVG','DESC','ASC','HAVING','NOT','IN','IS','NULL','CASE','WHEN','THEN','ELSE','END'];
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function formatBytes(bytes) {
+    const kb = 1024;
+    const mb = kb * 1024;
+    const gb = mb * 1024;
+    const tb = gb * 1024;
+
+    if (bytes >= tb)
+        return `${(bytes / tb).toFixed(2)} TB`;
+
+    if (bytes >= gb)
+        return `${(bytes / gb).toFixed(2)} GB`;
+
+    if (bytes >= mb)
+        return `${(bytes / mb).toFixed(2)} MB`;
+
+    if (bytes >= kb)
+        return `${(bytes / kb).toFixed(2)} KB`;
+
+    return `${bytes} B`;
+}
+
+function highlightSql(sql, highlightTokens) {
+  let out = escapeHtml(sql);
+  out = out.replace(/(&#39;[^&]*?&#39;)/g, '<span class="str">$1</span>');
+  out = out.replace(/(`[^`]+`)/g, '<span class="str">$1</span>');
+  const kwPattern = new RegExp('\\b(' + SQL_KEYWORDS.join('|').replace(/ /g, '\\s+') + ')\\b', 'gi');
+  out = out.replace(kwPattern, m => '<span class="kw">' + m.toUpperCase() + '</span>');
+  out = out.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="num">$1</span>');
+  if (highlightTokens) {
+    highlightTokens.forEach(t => {
+      const re = new RegExp('(' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'g');
+      out = out.replace(re, '<span class="add">$1</span>');
+    });
+  }
+  return out;
+}
+
+function formatCost(cost){
+    if(cost >= 1)
+        return `$${cost.toFixed(2)}`;
+
+    return `$${cost.toFixed(4)}`;
+}
+
+function getBadges(explanation){
+    const text = explanation.toLowerCase();
+    const badges = [];
+
+    if(text.includes("partition"))
+        badges.push("Partition Pruning");
+
+    if(text.includes("column"))
+        badges.push("Column Pruning");
+
+    if(text.includes("cluster"))
+        badges.push("Cluster Pruning");
+
+    if(text.includes("select *"))
+        badges.push("Removed SELECT *");
+
+    if(text.includes("filter"))
+        badges.push("Predicate Pushdown");
+
+    badges.push("Context Verified");
+
+    return badges;
+}
+
+/* Pretty-print flat SQL onto multiple lines for readability */
+function formatSql(sql) {
+  return sql
+    .replace(/\s+(FROM|WHERE|GROUP BY|ORDER BY|LIMIT|HAVING)\s+/gi, '\n$1 ')
+    .replace(/\s+(JOIN|LEFT JOIN|INNER JOIN)\s+/gi, '\n$1 ')
+    .replace(/\s+(ON)\s+/gi, '\n  $1 ')
+    .replace(/\s+(AND|OR)\s+/gi, '\n  $1 ')
+    .trim();
+}
+
+/* ── Render: Executive Banner ───────────────────────────── */
+function renderBanner(d) {
+  const m = d.summary_metrics;
+  const passed = /PASS/i.test(d.guardrail_status);
+  const statusColor = passed ? 'green' : 'red';
+
+  document.getElementById('execBanner').innerHTML = `
+    <div class="px-6 pt-5 pb-4 border-b border-[#1e2836] flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <div class="flex items-center gap-2.5 mb-2">
+          <i data-lucide="git-branch" class="w-4 h-4 text-sky-400"></i>
+          <span class="mono text-[14px] font-medium text-slate-100">${escapeHtml(d.release_id)}</span>
+          <span class="text-slate-700">/</span>
+          <span class="mono text-[13px] text-sky-400">${escapeHtml(d.branch)}</span>
+        </div>
+        <p class="text-[12px] text-slate-500">
+          <span class="text-slate-300 font-medium">${m.total_queries_evaluated} queries</span> evaluated in this release ·
+          BigQuery dry run complete · Gemini 1.5 Pro context cache hit
+        </p>
+      </div>
+      <div class="flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-${statusColor}-500/10 border border-${statusColor}-500/40">
+        <span class="w-2 h-2 rounded-full bg-${statusColor}-400 pulse-dot"></span>
+        <div>
+          <div class="text-[12px] font-semibold text-${statusColor}-400 tracking-wide">${escapeHtml(d.guardrail_status)}</div>
+          <div class="text-[10px] text-${statusColor}-600 mono">budget approved for merge</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-[#1e2836]">
+      <div class="px-6 py-5">
+        <div class="flex items-center gap-1.5 mb-2">
+          <i data-lucide="trending-up" class="w-3.5 h-3.5 text-red-400"></i>
+          <span class="text-[10px] uppercase tracking-[0.09em] text-slate-500 font-medium">Original annual cost</span>
+        </div>
+        <div class="mono text-[26px] font-semibold text-red-400 leading-none">${usd0(m.annual_original_cost_usd)}</div>
+        <div class="text-[11px] text-slate-600 mt-1.5">unoptimized · per year</div>
+      </div>
+
+      <div class="px-6 py-5">
+        <div class="flex items-center gap-1.5 mb-2">
+          <i data-lucide="sparkles" class="w-3.5 h-3.5 text-green-400"></i>
+          <span class="text-[10px] uppercase tracking-[0.09em] text-slate-500 font-medium">AI-optimized annual cost</span>
+        </div>
+        <div class="mono text-[26px] font-semibold text-green-400 leading-none">${usd0(m.annual_optimized_cost_usd)}</div>
+        <div class="text-[11px] text-slate-600 mt-1.5">post-Gemini rewrite · per year</div>
+      </div>
+
+      <div class="px-6 py-5">
+        <div class="flex items-center gap-1.5 mb-2">
+          <i data-lucide="piggy-bank" class="w-3.5 h-3.5 text-sky-400"></i>
+          <span class="text-[10px] uppercase tracking-[0.09em] text-slate-500 font-medium">Net annual savings</span>
+        </div>
+        <div class="mono text-[26px] font-semibold text-sky-400 leading-none">${usd0(m.net_annual_savings_usd)}</div>
+        <div class="text-[11px] text-slate-600 mt-1.5">${usd0(m.net_annual_savings_usd / 12)} / Estimated Monthly Savings</div>
+      </div>
+
+      <div class="px-6 py-5 bg-green-500/[0.04]">
+        <div class="flex items-center gap-1.5 mb-2">
+          <i data-lucide="badge-percent" class="w-3.5 h-3.5 text-green-400"></i>
+          <span class="text-[10px] uppercase tracking-[0.09em] text-slate-500 font-medium">Cost reduction</span>
+        </div>
+        <div class="mono text-[26px] font-semibold text-green-400 leading-none">${pct(m.savings_percentage)}</div>
+        <div class="w-full h-1.5 rounded-full bg-slate-800 mt-3 overflow-hidden">
+          <div class="bar-fill h-full rounded-full bg-green-500" style="width:0%" data-target="${m.savings_percentage}"></div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ── Render: Query cards ────────────────────────────────── */
+function renderQueries(queries) {
+  const host = document.getElementById('queryList');
+  host.innerHTML = queries.map((q, i) => {
+    const annualOrig = q.original_cost_per_run * q.runs_per_day * 365;
+    const annualOpt  = q.optimized_cost_per_run * q.runs_per_day * 365;
+    const tbRatio = (q.optimized_bytes_scanned / q.original_bytes_scanned) * 100;
+    return `
+    <div class="panel rounded-xl overflow-hidden card-hover fade-in" style="animation-delay:${i * 70}ms">
+
+      <!-- Summary header (clickable) -->
+      <button class="w-full text-left px-5 py-4 flex flex-wrap items-center gap-4 hover:bg-white/[0.015] transition" data-toggle="${q.query_id}">
+        <div class="flex items-center gap-3 min-w-[260px] flex-1">
+          <div class="w-8 h-8 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center shrink-0">
+            <i data-lucide="file-terminal" class="w-4 h-4 text-slate-400"></i>
+          </div>
+          <div class="min-w-0">
+            <div class="mono text-[13px] font-medium text-slate-100 truncate">${escapeHtml(q.file_name)}</div>
+            <div class="flex items-center gap-1.5 mt-0.5">
+              <i data-lucide="workflow" class="w-3 h-3 text-slate-600"></i>
+              <span class="mono text-[11px] text-slate-500">${escapeHtml(q.dag_task_id)}</span>
+              <span class="text-slate-700 text-[11px]">·</span>
+              <span class="mono text-[11px] text-slate-500">${q.runs_per_day}× / day</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-5 sm:gap-7">
+          <div class="text-right">
+            <div class="text-[10px] uppercase tracking-wider text-slate-600 mb-0.5">Original / yr</div>
+            <div class="mono text-[14px] font-medium text-red-400">${usd0(annualOrig)}</div>
+          </div>
+          <i data-lucide="arrow-right" class="w-4 h-4 text-slate-700 shrink-0"></i>
+          <div class="text-right">
+            <div class="text-[10px] uppercase tracking-wider text-slate-600 mb-0.5">Optimized / yr</div>
+            <div class="mono text-[14px] font-medium text-green-400">${usd0(annualOpt)}</div>
+          </div>
+          <div class="px-2.5 py-1 rounded-md bg-green-500/10 border border-green-500/30">
+            <span class="mono text-[13px] font-semibold text-green-400">−${pct(q.individual_savings_percent)}</span>
+          </div>
+          <i data-lucide="chevron-down" class="chev w-4 h-4 text-slate-500 shrink-0" data-chev="${q.query_id}"></i>
+        </div>
+      </button>
+
+      <!-- Expandable detail -->
+      <div class="accordion-body border-t border-[#1e2836]" data-body="${q.query_id}">
+        <div class="p-5 space-y-4">
+
+          <!-- Dry run metrics strip -->
+          <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div class="sunken rounded-lg p-3.5">
+              <div class="text-[10px] uppercase tracking-wider text-slate-600 mb-1.5">Original Scan Size</div>
+              <div class="mono text-[17px] font-semibold text-red-400">${formatBytes(q.original_bytes_scanned)}</div>
+              <div class="w-full h-1 rounded-full bg-slate-800 mt-2.5 overflow-hidden">
+                <div class="h-full rounded-full bg-red-500" style="width:100%"></div>
+              </div>
+            </div>
+            <div class="sunken rounded-lg p-3.5">
+              <div class="text-[10px] uppercase tracking-wider text-slate-600 mb-1.5">Optimized Scan Size</div>
+              <div class="mono text-[17px] font-semibold text-green-400">${formatBytes(q.optimized_bytes_scanned)}</div>
+              <div class="w-full h-1 rounded-full bg-slate-800 mt-2.5 overflow-hidden">
+                <div class="bar-fill h-full rounded-full bg-green-500" style="width:0%" data-target="${tbRatio}"></div>
+              </div>
+            </div>
+            <div class="sunken rounded-lg p-3.5">
+              <div class="text-[10px] uppercase tracking-wider text-slate-600 mb-1.5">Cost per run — before</div>
+              <div class="mono text-[17px] font-semibold text-red-400">${formatCost(q.original_cost_per_run)}</div>
+              <div class="text-[10px] text-slate-600 mt-2 mono">${usd0(annualOrig)} annualized</div>
+            </div>
+            <div class="sunken rounded-lg p-3.5">
+              <div class="text-[10px] uppercase tracking-wider text-slate-600 mb-1.5">Cost per run — after</div>
+              <div class="mono text-[17px] font-semibold text-green-400">${formatCost(q.optimized_cost_per_run)}</div>
+              <div class="text-[10px] text-slate-600 mt-2 mono">${usd0(annualOpt)} annualized</div>
+            </div>
+          </div>
+
+          <!-- Side-by-side SQL diff -->
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            <div class="sunken rounded-lg overflow-hidden">
+              <div class="px-3.5 py-2 border-b border-[#1e2836] flex items-center justify-between bg-red-500/[0.04]">
+                <div class="flex items-center gap-2">
+                  <i data-lucide="minus-circle" class="w-3.5 h-3.5 text-red-400"></i>
+                  <span class="text-[11px] font-medium text-red-400 uppercase tracking-wider">Original SQL</span>
+                </div>
+                <span class="mono text-[10px] text-slate-600">${formatBytes(q.original_bytes_scanned)}</span>
+              </div>
+              <div class="p-3.5 overflow-x-auto">
+                <pre class="mono text-[11.5px] leading-[1.75] text-slate-300">${highlightSql(formatSql(q.original_sql))}</pre>
+              </div>
+            </div>
+
+            <div class="sunken rounded-lg overflow-hidden">
+              <div class="px-3.5 py-2 border-b border-[#1e2836] flex items-center justify-between bg-green-500/[0.04]">
+                <div class="flex items-center gap-2">
+                  <i data-lucide="plus-circle" class="w-3.5 h-3.5 text-green-400"></i>
+                  <span class="text-[11px] font-medium text-green-400 uppercase tracking-wider">Gemini rewritten SQL</span>
+                </div>
+                <span class="mono text-[10px] text-slate-600">${formatBytes(q.optimized_bytes_scanned)}</span>
+              </div>
+              <div class="p-3.5 overflow-x-auto">
+                <pre class="mono text-[11.5px] leading-[1.75] text-slate-300">${highlightSql(formatSql(q.optimized_sql))}</pre>
+              </div>
+            </div>
+          </div>
+
+          <!-- AI reasoning box -->
+          <div class="rounded-lg border border-green-500/25 bg-green-500/[0.05] p-4">
+            <div class="flex items-center gap-2 mb-2">
+              <i data-lucide="brain-circuit" class="w-4 h-4 text-green-400"></i>
+              <span class="text-[11px] font-medium text-green-400 uppercase tracking-[0.09em]">Gemini reasoning — structural fix applied</span>
+            </div>
+            <p class="text-[12.5px] leading-relaxed text-green-200/80">${escapeHtml(q.ai_explanation)}</p>
+            <div class="flex flex-wrap gap-2 mt-3">
+                ${getBadges(q.ai_explanation).map(badge => `
+                    <span class="mono text-[10px] px-2 py-1 rounded
+                        bg-green-500/10 border border-green-500/20
+                        text-green-400">
+                        ${badge}
+                    </span>
+                `).join("")}
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/* ── Render: Context verification footer ────────────────── */
+function renderContextFooter(cv) {
+  const cache = cv.vertex_cache ?? {
+      status: "N/A",
+      token_count: 0,
+      read_cost: 0,
+      storage_cost_per_hour: 0
+  };
+  const items = [
+    { icon: 'database',   label: 'BigQuery schemas checked',   value: cv.bq_schemas_checked,        note: 'Partition + cluster metadata resolved' },
+    { icon: 'file-json',  label: 'Avro mappings matched',      value: cv.avro_mappings_matched,     note: 'No downstream schema breakage detected' },
+    { icon: 'file-code',  label: 'Dataflow logic validated',   value: cv.dataflow_logic_validated,  note: 'Column references cross-checked in Java' },
+    {icon: 'brain-circuit',label: 'Vertex AI Context Cache', value: `${cache.status} • ${cache.token_count.toLocaleString()} tokens`, note: `Read: $${cache.read_cost.toFixed(6)} · Storage: $${cache.storage_cost_per_hour.toFixed(6)}/hr`
+    }
+  ];
+
+  document.getElementById('contextFooter').innerHTML = `
+    <div class="panel rounded-2xl p-5">
+      <div class="flex items-center gap-2 mb-4">
+        <i data-lucide="shield-check" class="w-4 h-4 text-sky-400"></i>
+        <h2 class="text-[12px] font-medium uppercase tracking-[0.1em] text-slate-400">Vertex AI context cache verification</h2>
+        <span class="mono text-[10px] px-2 py-0.5 rounded bg-sky-500/10 border border-sky-500/25 text-sky-400 ml-1">
+            ${cache.status} · ${cache.token_count.toLocaleString()} tokens
+        </span>
+        </div>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+        ${items.map(it => `
+          <div class="sunken rounded-lg p-4">
+            <div class="flex items-start gap-3">
+              <div class="w-7 h-7 rounded-md bg-green-500/10 border border-green-500/25 flex items-center justify-center shrink-0 mt-0.5">
+                <i data-lucide="check" class="w-3.5 h-3.5 text-green-400"></i>
+              </div>
+              <div class="min-w-0">
+                <div class="flex items-center gap-1.5 mb-1">
+                  <i data-lucide="${it.icon}" class="w-3 h-3 text-slate-600"></i>
+                  <span class="text-[11px] text-slate-500">${it.label}</span>
+                </div>
+                <div class="mono text-[12px] font-medium text-green-400 break-words">${escapeHtml(it.value)}</div>
+                <div class="text-[10.5px] text-slate-600 mt-1">${it.note}</div>
+              </div>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
+
+/* ── Accordion wiring ───────────────────────────────────── */
+function wireAccordions() {
+  document.querySelectorAll('[data-toggle]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id   = btn.getAttribute('data-toggle');
+      const body = document.querySelector(`[data-body="${id}"]`);
+      const chev = document.querySelector(`[data-chev="${id}"]`);
+      const opening = !body.classList.contains('open');
+      body.classList.toggle('open', opening);
+      chev.classList.toggle('open', opening);
+      if (opening) setTimeout(animateBars, 60);
+    });
+  });
+
+  document.getElementById('expandAll').addEventListener('click', () => {
+    document.querySelectorAll('.accordion-body').forEach(b => b.classList.add('open'));
+    document.querySelectorAll('.chev').forEach(c => c.classList.add('open'));
+    setTimeout(animateBars, 60);
+  });
+  document.getElementById('collapseAll').addEventListener('click', () => {
+    document.querySelectorAll('.accordion-body').forEach(b => b.classList.remove('open'));
+    document.querySelectorAll('.chev').forEach(c => c.classList.remove('open'));
+  });
+}
+
+/* ── Animate progress bars to their data-target width ───── */
+function animateBars() {
+  document.querySelectorAll('.bar-fill[data-target]').forEach(bar => {
+    const t = Math.min(100, Math.max(0, parseFloat(bar.getAttribute('data-target')) || 0));
+    requestAnimationFrame(() => { bar.style.width = t + '%'; });
+  });
+}
+
+/* ── Toast helper ───────────────────────────────────────── */
+function toast(msg, icon = 'check-circle', tone = 'green') {
+  const host = document.getElementById('toastHost');
+  const el = document.createElement('div');
+  el.className = `flex items-center gap-2.5 px-4 py-3 rounded-lg bg-[#121824] border border-${tone}-500/35 shadow-xl fade-in`;
+  el.innerHTML = `<i data-lucide="${icon}" class="w-4 h-4 text-${tone}-400"></i><span class="text-[12.5px] text-slate-200">${escapeHtml(msg)}</span>`;
+  host.appendChild(el);
+  if (window.lucide) lucide.createIcons();
+  setTimeout(() => { el.style.transition = 'opacity 300ms'; el.style.opacity = '0'; setTimeout(() => el.remove(), 320); }, 3200);
+}
+
+/* ── Action handlers ────────────────────────────────────── */
+function approveRelease() {
+  const d = RELEASE_DATA;
+  toast(`${d.release_id} approved — merging ${d.branch} into main`, 'git-merge', 'green');
+}
+function downloadReport() {
+  const d = RELEASE_DATA;
+  const blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `po_cost_audit_${d.release_id}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('PO cost audit payload exported', 'file-down', 'sky');
+}
+function rerunAnalysis() {
+  toast('Dry run re-queued — 3 queries submitted to BigQuery', 'refresh-cw', 'sky');
+  document.querySelectorAll('.bar-fill').forEach(b => b.style.width = '0%');
+  setTimeout(animateBars, 220);
+}
+
+/* ── Boot ───────────────────────────────────────────────── */
+document.addEventListener('DOMContentLoaded', async () => {
+  let data = RELEASE_DATA;
+
+  // Prefer live backend when served by FastAPI; fall back to embedded payload.
+  try {
+    const res = await fetch('/api/latest-report', { cache: 'no-store' });
+    if (res.ok) {
+      const live = await res.json();
+      if (live && live.queries && live.queries.length) data = live;
+    }
+  } catch (_) { /* offline / standalone file — embedded payload is used */ }
+
+  renderBanner(data);
+  renderQueries(data.queries);
+  renderContextFooter(data.context_verification);
+  wireAccordions();
+
+  if (window.lucide) lucide.createIcons();
+
+  // Open the first (highest-impact) query by default for the demo.
+  const first = data.queries[0];
+  if (first) {
+    document.querySelector(`[data-body="${first.query_id}"]`)?.classList.add('open');
+    document.querySelector(`[data-chev="${first.query_id}"]`)?.classList.add('open');
+  }
+
+  setTimeout(animateBars, 180);
+
+  const stamp = new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+  document.getElementById('footerStamp').textContent = `Last dry run · ${stamp}`;
+  document.getElementById('liveClock').textContent = `Analysis complete · ${data.queries.length} queries`;
+});
+</script>
+</body>
+</html>
