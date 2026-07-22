@@ -125,9 +125,9 @@
         <i data-lucide="file-down" class="w-4 h-4"></i>
         Download PO cost audit report (PDF)
       </button>
-      <button onclick="rerunAnalysis()" class="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[13px] font-medium transition active:scale-[0.98]">
-        <i data-lucide="refresh-cw" class="w-4 h-4"></i>
-        Re-run dry run analysis
+      <button id="scanBtn" onclick="scanRepository()" class="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[13px] font-medium transition active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed">
+        <i data-lucide="radar" class="w-4 h-4"></i>
+        Scan entire repository
       </button>
       <div class="ml-auto text-[11px] text-slate-600 mono" id="footerStamp"></div>
     </div>
@@ -159,9 +159,9 @@ const RELEASE_DATA = {
       "file_name": "01_daily_transaction_ledger.sql",
       "dag_task_id": "stage_txn_ledger",
       "runs_per_day": 10,
-      "original_tb_scanned": 22.8,
+      "original_bytes_scanned": 25073068082,
       "original_cost_per_run": 142.50,
-      "optimized_tb_scanned": 1.3,
+      "optimized_bytes_scanned": 1429365116,
       "optimized_cost_per_run": 8.20,
       "individual_savings_percent": 94.2,
       "original_sql": "SELECT * FROM `prod_finance.transaction_ledger` t JOIN `prod_finance.user_profiles` u ON t.user_id = u.user_id",
@@ -183,9 +183,9 @@ const RELEASE_DATA = {
       "file_name": "02_customer_risk_aggregation.sql",
       "dag_task_id": "calc_risk_score",
       "runs_per_day": 4,
-      "original_tb_scanned": 10.4,
+      "original_bytes_scanned": 11437451572,
       "original_cost_per_run": 65.00,
-      "optimized_tb_scanned": 1.9,
+      "optimized_bytes_scanned": 2089298739,
       "optimized_cost_per_run": 12.10,
       "individual_savings_percent": 81.3,
       "original_sql": "SELECT user_id, COUNT(*) FROM `prod_finance.credit_score_audit` GROUP BY user_id",
@@ -215,9 +215,9 @@ const RELEASE_DATA = {
       "file_name": "03_monthly_settlement_join.sql",
       "dag_task_id": "settlement_reconcile",
       "runs_per_day": 1,
-      "original_tb_scanned": 9.7,
+      "original_bytes_scanned": 10668023808,
       "original_cost_per_run": 61.00,
-      "optimized_tb_scanned": 0.38,
+      "optimized_bytes_scanned": 417843737,
       "optimized_cost_per_run": 2.40,
       "individual_savings_percent": 96.0,
       "original_sql": "SELECT * FROM `prod_finance.monthly_settlements` WHERE status = 'PENDING'",
@@ -630,7 +630,9 @@ function wireAccordions() {
       if (opening) setTimeout(animateBars, 60);
     });
   });
+}
 
+function wireGlobalButtons() {
   document.getElementById('expandAll').addEventListener('click', () => {
     document.querySelectorAll('.accordion-body').forEach(b => b.classList.add('open'));
     document.querySelectorAll('.chev').forEach(c => c.classList.add('open'));
@@ -665,11 +667,11 @@ function toast(msg, icon = 'check-circle', tone = 'green') {
 
 /* ── Action handlers ────────────────────────────────────── */
 function approveRelease() {
-  const d = RELEASE_DATA;
+  const d = currentData;
   toast(`${d.release_id} approved — merging ${d.branch} into main`, 'git-merge', 'green');
 }
 function downloadReport() {
-  const d = RELEASE_DATA;
+  const d = currentData;
   const blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -679,10 +681,53 @@ function downloadReport() {
   URL.revokeObjectURL(url);
   toast('PO cost audit payload exported', 'file-down', 'sky');
 }
-function rerunAnalysis() {
-  toast('Dry run re-queued — 3 queries submitted to BigQuery', 'refresh-cw', 'sky');
-  document.querySelectorAll('.bar-fill').forEach(b => b.style.width = '0%');
-  setTimeout(animateBars, 220);
+
+let currentData = RELEASE_DATA
+
+function renderAll(data) {
+  currentData = data;
+  renderBanner(data);
+  renderQueries(data.queries);
+  renderContextFooter(data.context_verification);
+  wireAccordions();
+  if (window.lucide) lucide.createIcons();
+
+  const first = data.queries[0];
+  if (first) {
+    document.querySelector(`[data-body="${first.query_id}"]`)?.classList.add('open');
+    document.querySelector(`[data-chev="${first.query_id}"]`)?.classList.add('open');
+  }
+  setTimeout(animateBars, 180);
+  document.getElementById('liveClock').textContent =
+    `Analysis complete · ${data.queries.length} queries`;
+}
+
+async function scanRepository() {
+  const btn = document.getElementById('scanBtn');
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i> Scanning… ~2 min`;
+  if (window.lucide) lucide.createIcons();
+  toast('Full repo scan started — dry-running every query', 'radar', 'sky');
+
+  try {
+    const res = await fetch('/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ref: 'main' })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const out = await res.json();
+    renderAll(out.ui_report);
+    toast(`Scan complete — ${out.files_analyzed} of ${out.files_found} queries analysed`,
+          'check-circle', 'green');
+  } catch (e) {
+    toast(`Scan failed: ${e.message}`, 'alert-triangle', 'red');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = original;
+    if (window.lucide) lucide.createIcons();
+  }
 }
 
 /* ── Boot ───────────────────────────────────────────────── */
@@ -696,25 +741,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (live && live.queries && live.queries.length) data = live;
     }
   } catch (_) {}
-
-  renderBanner(data);
-  renderQueries(data.queries);
-  renderContextFooter(data.context_verification);
-  wireAccordions();
-
-  if (window.lucide) lucide.createIcons();
-
-  const first = data.queries[0];
-  if (first) {
-    document.querySelector(`[data-body="${first.query_id}"]`)?.classList.add('open');
-    document.querySelector(`[data-chev="${first.query_id}"]`)?.classList.add('open');
-  }
-
-  setTimeout(animateBars, 180);
+  wireGlobalButtons();
+  renderAll(data);
 
   const stamp = new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
   document.getElementById('footerStamp').textContent = `Last dry run · ${stamp}`;
-  document.getElementById('liveClock').textContent = `Analysis complete · ${data.queries.length} queries`;
 });
 </script>
 </body>
