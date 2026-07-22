@@ -376,13 +376,18 @@ def ask_gemini_for_rewrite(old_sql, new_sql, cache_name, schema_manifest, beam_c
   list at all, that's a correctness bug (would cause a KeyError at
   runtime) — report it under "recommendations", do not silently add it.
 - For "risks": the Beam consumer for THIS SQL file is `{consumer_file}`.
-  Check ONLY that file. For each column it accesses in arithmetic (+,-,*,/),
-  numeric comparison (>,<,>=,<=,!=), or type-sensitive operations:
+  Scan ALL functions in that file, including helper functions called
+  from the main processing function — not just the top-level entry point.
+  For each column accessed in arithmetic (+,-,*,/), numeric comparison
+  (>,<,>=,<=,!=), or type-sensitive operations anywhere in the file:
   (1) find that column in the SQL SELECT list — if it appears without an
   explicit CAST it keeps its INFORMATION_SCHEMA base type; CAST in WHERE/
   ORDER BY/window functions does NOT change output type.
   (2) look up the base type in INFORMATION_SCHEMA.
   (3) if the type is STRING or BYTES, flag it HIGH severity.
+  Note: Python never implicitly converts types — `"5" > 2` raises TypeError
+  regardless of the string's contents, even if a WHERE CAST filter ensures
+  the values are numeric strings.
 
 **Input:**
 {schema_manifest}
