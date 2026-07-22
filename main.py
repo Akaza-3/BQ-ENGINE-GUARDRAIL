@@ -67,9 +67,10 @@ storage_client = storage.Client(project=PROJECT_ID)
 # -----------------------------------------------------------------
 QUERY_RUNTIME_CONFIG = {
     "resources/sql/retail_lending_portfolio.sql": {"dag_task_id": "rm_report_daily", "runs_per_day": 4},
-    "resources/sql/customer_risk_dashboard.sql": {"dag_task_id": "risk_dashboard_hourly", "runs_per_day": 24},
-    "resources/sql/delinquency_alerts.sql": {"dag_task_id": "delinquency_scan", "runs_per_day": 12},
-    "resources/sql/employer_concentration.sql": {"dag_task_id": "employer_concentration_weekly", "runs_per_day": 1},
+    "resources/sql/customer_risk_dashboard.sql": {"dag_task_id": "risk_dashboard_hourly", "runs_per_day": 7, "beam_consumer": "dashboard.py"},
+    "resources/sql/delinquency_alerts.sql": {"dag_task_id": "delinquency_scan", "runs_per_day": 12, "beam_consumer": "delinquency_alerts.py"},
+    "resources/sql/employer_concentration.sql": {"dag_task_id": "employer_concentration_weekly", "runs_per_day": 1, "beam_consumer": "employer_concentration.py"},
+    "resources/sql/high_risk_watchlist.sql": {"dag_task_id": "risk_watchlist","runs_per_day":3, "beam_consumer": "watchlist.py"}
 }
 DEFAULT_RUNTIME_CONFIG = {"dag_task_id": "unscheduled", "runs_per_day": 1}
 
@@ -361,7 +362,7 @@ def get_or_create_cache(schema_manifest: str, beam_context: str):
         }
 
 
-def ask_gemini_for_rewrite(old_sql: str, new_sql: str, cache_name, schema_manifest, beam_context, original_bytes: int) -> str:
+def ask_gemini_for_rewrite(old_sql, new_sql, cache_name, schema_manifest, beam_context, original_bytes, consumer_file="") -> str:
     prompt = f"""You are an expert Google BigQuery SQL optimizer.
 
 **Strict Rules (never break these):**
@@ -374,15 +375,14 @@ def ask_gemini_for_rewrite(old_sql: str, new_sql: str, cache_name, schema_manife
   code references a field that does NOT appear in the query's SELECT
   list at all, that's a correctness bug (would cause a KeyError at
   runtime) — report it under "recommendations", do not silently add it.
-- For "risks": scan the Beam consumer code for any column used in arithmetic,
-    comparison, or type-sensitive operation where the SQL schema shows that column
-    as STRING. Each such mismatch is a risk entry. If none found, return an empty list.
-    IMPORTANT: a column's output type is its INFORMATION_SCHEMA type UNLESS it is
-    explicitly CAST in the SELECT list itself. CAST in WHERE clauses, ORDER BY, or
-    window function arguments does NOT change the output type. Example:
-    `SELECT delinq_2yrs FROM t WHERE CAST(delinq_2yrs AS INT64) > 0` — delinq_2yrs
-    is still STRING when it reaches the Beam consumer. Flag any STRING column used
-    in arithmetic (+,-,*,/) or numeric comparison (>,<,>=,<=) as severity HIGH.
+- For "risks": the Beam consumer for THIS SQL file is `{consumer_file}`.
+  Check ONLY that file. For each column it accesses in arithmetic (+,-,*,/),
+  numeric comparison (>,<,>=,<=,!=), or type-sensitive operations:
+  (1) find that column in the SQL SELECT list — if it appears without an
+  explicit CAST it keeps its INFORMATION_SCHEMA base type; CAST in WHERE/
+  ORDER BY/window functions does NOT change output type.
+  (2) look up the base type in INFORMATION_SCHEMA.
+  (3) if the type is STRING or BYTES, flag it HIGH severity.
 
 **Input:**
 {schema_manifest}
@@ -589,6 +589,7 @@ def review():
         schema_manifest = build_schema_manifest(change["new"])
         cache_info = get_or_create_cache(schema_manifest, beam_context)
         cache_name = cache_info["name"]
+        consumer = QUERY_RUNTIME_CONFIG.get(change["path"], {}).get("beam_consumer", "")
 
         rewrite = ask_gemini_for_rewrite(
             change["old"],
@@ -597,6 +598,7 @@ def review():
             schema_manifest,
             beam_context,
             new_bytes,
+            consumer_file = consumer
         )
 
         # -----------------------------
