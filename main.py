@@ -413,6 +413,14 @@ Return **ONLY** valid JSON (no markdown, no extra text):
   "changes": [
     {{"change": "Removed unused column X", "reason": "Not used by Beam pipeline"}}
   ],
+  "column_type_analysis": [
+    {{
+        "column": "column_name",
+        "beam_expression": "exact Python expression",
+        "sql_output_type": "STRING or INT64 etc — from INFORMATION_SCHEMA, ignoring WHERE/ORDER BY casts",
+        "is_risky": true
+    }}
+  ],
   "risks": [
     {{
       "severity": "HIGH",
