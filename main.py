@@ -244,9 +244,13 @@ def _extract_tables(sql_text: str):
 
 
 def _count_tables_by_dataset(changed_results):
+    seen = set()
     counts = Counter()
     for r in changed_results:
         for t in _extract_tables(r["new_sql"]):
+            if t in seen:
+                continue
+            seen.add(t)
             parts = t.split(".")
             dataset = parts[-2] if len(parts) >= 2 else "unknown"
             counts[dataset] += 1
