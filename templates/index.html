@@ -553,6 +553,25 @@ function renderQueries(queries) {
             </div>
           </div>
 
+          <!-- Test harness -->
+          <div class="rounded-lg border border-indigo-500/25 bg-indigo-500/[0.04] p-4">
+            <div class="flex items-center justify-between gap-3 flex-wrap">
+              <div class="flex items-center gap-2">
+                <i data-lucide="flask-conical" class="w-4 h-4 text-indigo-400"></i>
+                <span class="text-[11px] font-medium text-indigo-400 uppercase tracking-[0.09em]">Test data harness</span>
+              </div>
+              <button id="testBtn-${q.query_id}"
+                onclick="runQueryTest(event, '${q.query_id}', ${JSON.stringify(q.file_name)}, ${JSON.stringify(q.optimized_sql || '')})"
+                class="flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-900/60 hover:bg-indigo-800/70 border border-indigo-700/50 text-indigo-200 text-[12px] font-medium transition active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed">
+                <i data-lucide="play" class="w-3.5 h-3.5"></i>
+                Run Tests
+              </button>
+            </div>
+            <div id="testResult-${q.query_id}" class="mt-3 hidden">
+              <div id="testResultInner-${q.query_id}" class="text-[12px] text-slate-300"></div>
+            </div>
+          </div>
+
         </div>
       </div>
     </div>`;
@@ -723,6 +742,63 @@ async function scanRepository() {
           'check-circle', 'green');
   } catch (e) {
     toast(`Scan failed: ${e.message}`, 'alert-triangle', 'red');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = original;
+    if (window.lucide) lucide.createIcons();
+  }
+}
+
+async function runQueryTest(event, queryId, fileName, optimizedSql) {
+  event.stopPropagation();
+  const btn = document.getElementById(`testBtn-${queryId}`);
+  const resultBox = document.getElementById(`testResult-${queryId}`);
+  const resultInner = document.getElementById(`testResultInner-${queryId}`);
+  const original = btn.innerHTML;
+
+  if (!optimizedSql) {
+    toast('No optimized SQL available — run a scan first', 'alert-triangle', 'yellow');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerHTML = `<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin"></i> Running…`;
+  if (window.lucide) lucide.createIcons();
+  resultBox.classList.remove('hidden');
+  resultInner.innerHTML = `<span class="text-slate-500">Generating test cases and loading data…</span>`;
+
+  try {
+    const res = await fetch('/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql_path: fileName, sql_text: optimizedSql })
+    });
+    const out = await res.json();
+
+    if (out.status === 'ok') {
+      const pct = out.pass_rate_pct;
+      const color = out.failed === 0 ? 'green' : 'yellow';
+      const icon  = out.failed === 0 ? '✅' : '⚠️';
+      resultInner.innerHTML = `
+        <div class="flex items-center gap-3 flex-wrap">
+          <span class="text-[13px] font-semibold text-${color}-400">${icon} ${out.passed}/${out.total} tests passed (${pct}%)</span>
+          ${out.report_gcs_path ? `<span class="mono text-[11px] text-slate-500">${out.report_gcs_path}</span>` : ''}
+        </div>
+        <div class="mt-2 space-y-1">
+          ${out.results.map(r => `
+            <div class="flex items-start gap-2 text-[11.5px]">
+              <span>${r.passed ? '✅' : '❌'}</span>
+              <span class="text-slate-400"><span class="mono text-slate-500">[${r.category}]</span> ${escapeHtml(r.description)} — <em class="text-slate-500">${escapeHtml(r.note)}</em></span>
+            </div>`).join('')}
+        </div>`;
+      toast(`${fileName}: ${out.passed}/${out.total} passed`, out.failed === 0 ? 'check-circle' : 'alert-triangle', out.failed === 0 ? 'green' : 'yellow');
+    } else {
+      resultInner.innerHTML = `<span class="text-red-400">Error: ${escapeHtml(out.message || 'unknown error')}</span>`;
+      toast(`Test failed: ${out.message}`, 'x-circle', 'red');
+    }
+  } catch (e) {
+    resultInner.innerHTML = `<span class="text-red-400">Network error: ${escapeHtml(e.message)}</span>`;
+    toast(`Test error: ${e.message}`, 'x-circle', 'red');
   } finally {
     btn.disabled = false;
     btn.innerHTML = original;

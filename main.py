@@ -1691,6 +1691,7 @@ def analyze_one(change: dict, beam_context: str, beam_sources: dict, beam_index:
         "avro_status": avro_result["status"],
         "avro_schema": avro_result["schema_doc"],
         "avro_schema_gcs_path": avro_result["schema_gcs_path"],
+        "schema_manifest": schema_manifest,  # reused by test harness, avoids re-fetch
     }, cache_info
 
 
@@ -2011,6 +2012,343 @@ def analyze():
         "files_found": len(all_sql),
         "ui_report": ui_report,
     })
+
+
+# =================================================================
+# Test Data Harness
+# (originally query_test_harness.py by team lead — integrated here
+#  so it shares PROJECT_ID, bq_client, genai_client, and
+#  build_schema_manifest with the rest of the guardrail)
+# =================================================================
+PROD_DATASET = "loan_data"
+TEST_DATASET = "loan_data_test"
+
+_BQ_TYPE_MAP = {
+    "STRING": "STRING", "BYTES": "BYTES",
+    "INT64": "INT64", "INTEGER": "INTEGER", "INT": "INT64",
+    "FLOAT64": "FLOAT64", "FLOAT": "FLOAT64", "NUMERIC": "NUMERIC",
+    "BOOL": "BOOL", "BOOLEAN": "BOOL",
+    "DATE": "DATE", "DATETIME": "DATETIME",
+    "TIMESTAMP": "TIMESTAMP", "TIME": "TIME",
+    "ARRAY": "STRING", "STRUCT": "STRING",
+}
+
+_TEST_GEMINI_PROMPT = """
+You are a SQL test engineer. You have the EXACT BigQuery schema for every table
+this query references (fetched live from INFORMATION_SCHEMA). Use it to generate
+comprehensive test cases covering every logical branch.
+
+REAL BIGQUERY SCHEMA (column names and types are exact — use them as-is):
+{schema_block}
+
+SQL QUERY TO TEST:
+{sql}
+
+Generate test cases for:
+  POSITIVE — rows that SHOULD appear in the final result
+  NEGATIVE — rows that SHOULD be excluded
+  EDGE     — boundary values, NULLs, CAST on strings, window ties
+
+Rules:
+  - Use EXACT column names from the schema above
+  - Match BQ types: STRING columns get string values (even numeric-looking ones),
+    INT64 gets integers, FLOAT64 gets floats
+  - For columns the query CASTs, keep them as STRING in the test row
+  - Make customer_id unique per test case (prefix with test case id)
+  - For multi-table queries, provide rows for ALL tables with matching join keys
+
+Return ONLY valid JSON — an array of objects:
+{{
+  "id": "TC_P01_description",
+  "category": "positive" | "negative" | "edge",
+  "description": "one sentence",
+  "logic_tested": "CTE / filter / expression being exercised",
+  "expected": "in_result" | "not_in_result" | "exactly_N_rows",
+  "expected_count": 1,
+  "rows_per_table": {{
+    "project.dataset.table1": [ {{ col: val, ... }}, ... ],
+    "project.dataset.table2": [ {{ col: val, ... }}, ... ]
+  }}
+}}
+""".strip()
+
+
+def _parse_manifest_to_schema(manifest: str) -> dict[str, dict[str, str]]:
+    """Converts build_schema_manifest() output → {table: {col: bq_type}}."""
+    schemas: dict[str, dict[str, str]] = {}
+    current_table = None
+    for line in manifest.splitlines():
+        line = line.strip()
+        m = re.match(r"=+ TABLE\s*:\s*(.+?)\s*=+", line)
+        if m:
+            current_table = m.group(1).strip()
+            schemas[current_table] = {}
+            continue
+        if current_table and line.startswith("- "):
+            m2 = re.match(r"- (\w+)\s+\(([^)]+)\)", line)
+            if m2:
+                schemas[current_table][m2.group(1)] = m2.group(2)
+    return schemas
+
+
+def _schema_to_block(schemas: dict[str, dict[str, str]]) -> str:
+    lines = []
+    for table, cols in schemas.items():
+        lines.append(f"TABLE: {table}")
+        for col, bq_type in cols.items():
+            lines.append(f"  - {col}  ({bq_type})")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _generate_test_cases(sql_text: str, schema_block: str) -> list[dict]:
+    prompt = _TEST_GEMINI_PROMPT.format(schema_block=schema_block, sql=sql_text)
+    resp = genai_client.models.generate_content(
+        model="gemini-2.5-flash", contents=prompt, config={"temperature": 0}
+    )
+    raw = re.sub(r"^```(?:json)?|```$", "", resp.text.strip(), flags=re.MULTILINE).strip()
+    return json.loads(raw)
+
+
+def _create_test_table(table_ref: str, schema: dict[str, str]) -> str:
+    _, _, table_name = table_ref.split(".")
+    test_table_id = f"{PROJECT_ID}.{TEST_DATASET}.{table_name}"
+    fields = [
+        bigquery.SchemaField(col, _BQ_TYPE_MAP.get(bq_type, "STRING"))
+        for col, bq_type in schema.items()
+    ]
+    bq_client.delete_table(test_table_id, not_found_ok=True)
+    bq_client.create_table(bigquery.Table(test_table_id, schema=fields))
+    return test_table_id
+
+
+def _setup_test_tables(schemas: dict[str, dict[str, str]]) -> dict[str, str]:
+    ds = bigquery.Dataset(f"{PROJECT_ID}.{TEST_DATASET}")
+    ds.location = LOCATION
+    bq_client.create_dataset(ds, exists_ok=True)
+    return {ref: _create_test_table(ref, schema) for ref, schema in schemas.items()}
+
+
+def _load_test_data(test_cases: list[dict], table_mapping: dict[str, str]):
+    rows_by_table: dict[str, list[dict]] = {tid: [] for tid in table_mapping.values()}
+    for tc in test_cases:
+        for prod_ref, rows in tc.get("rows_per_table", {}).items():
+            test_id = table_mapping.get(prod_ref) or next(
+                (v for k, v in table_mapping.items()
+                 if k.endswith(prod_ref.split(".")[-1])), None
+            )
+            if test_id and rows:
+                cleaned = [{k: v for k, v in r.items() if v is not None} for r in rows]
+                rows_by_table.setdefault(test_id, []).extend(cleaned)
+    for test_id, rows in rows_by_table.items():
+        if rows:
+            errs = bq_client.insert_rows_json(test_id, rows)
+            if errs:
+                logger.warning(f"Insert errors in {test_id}: {errs}")
+            else:
+                logger.info(f"Loaded {len(rows)} rows → {test_id}")
+
+
+def _rewrite_to_test_dataset(sql_text: str) -> str:
+    return sql_text.replace(
+        f"`{PROJECT_ID}.{PROD_DATASET}.",
+        f"`{PROJECT_ID}.{TEST_DATASET}."
+    )
+
+
+def _validate_test_cases(test_cases: list[dict], actual_rows: list[dict]) -> list[dict]:
+    actual_ids = set(str(r.get("customer_id", "")) for r in actual_rows)
+    results = []
+    for tc in test_cases:
+        tc_ids = {
+            str(row.get("customer_id"))
+            for rows in tc.get("rows_per_table", {}).values()
+            for row in rows
+            if row.get("customer_id")
+        }
+        expected = tc.get("expected", "in_result")
+        found = sum(1 for cid in actual_ids if cid in tc_ids)
+        if expected == "in_result":
+            passed = found > 0
+            note = f"Found {found} row(s)" + (" ✓" if passed else " — expected ≥1")
+        elif expected == "not_in_result":
+            passed = found == 0
+            note = f"Found {found} row(s)" + (" ✓" if passed else " — expected 0")
+        elif expected == "exactly_N_rows":
+            n = tc.get("expected_count", 1)
+            passed = found == n
+            note = f"Found {found} row(s) — expected {n}" + (" ✓" if passed else " ✗")
+        else:
+            passed, note = False, f"Unknown expected: {expected}"
+        results.append({**tc, "passed": passed, "note": note})
+    return results
+
+
+def _upload_test_report_html(results: list[dict], sql_path: str,
+                              test_sql: str, manifest: str) -> str | None:
+    total = len(results)
+    passed = sum(1 for r in results if r["passed"])
+    failed = total - passed
+    pct = int(passed / total * 100) if total else 0
+
+    by_cat: dict[str, list] = {}
+    for r in results:
+        by_cat.setdefault(r["category"], []).append(r)
+
+    def rows_html(cases):
+        html = ""
+        for r in cases:
+            bg = "#d4edda" if r["passed"] else "#f8d7da"
+            icon = "✅" if r["passed"] else "❌"
+            html += (f"<tr style='background:{bg}'>"
+                     f"<td><code>{r['id']}</code></td>"
+                     f"<td style='text-align:center'>{icon}</td>"
+                     f"<td>{r['description']}</td>"
+                     f"<td><em>{r['logic_tested']}</em></td>"
+                     f"<td><code>{r['expected']}</code></td>"
+                     f"<td>{r['note']}</td></tr>")
+        return html
+
+    cat_meta = {
+        "positive": ("Positive Cases", "#d4edda", "#155724"),
+        "negative": ("Negative Cases", "#f8d7da", "#721c24"),
+        "edge":     ("Edge Cases",     "#fff3cd", "#856404"),
+    }
+    sections = ""
+    for cat, cases in by_cat.items():
+        title, bg, fg = cat_meta.get(cat, (cat.title(), "#eee", "#000"))
+        sections += (f"<h2>{title}</h2><table>"
+                     f"<tr><th>Test Case</th><th>Result</th><th>Description</th>"
+                     f"<th>Logic Tested</th><th>Expected</th><th>Outcome</th></tr>"
+                     f"{rows_html(cases)}</table>")
+
+    overall = (
+        "<p style='color:#28a745;font-weight:700'>✅ All test cases passed.</p>"
+        if failed == 0 else
+        f"<p style='color:#dc3545;font-weight:700'>❌ {failed} test case(s) failed.</p>"
+    )
+
+    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<title>Test Report — {sql_path}</title>
+<style>
+body{{font-family:-apple-system,sans-serif;margin:40px;color:#212529;background:#f8f9fa}}
+h1{{color:#343a40}}h2{{color:#495057;border-bottom:2px solid #dee2e6;padding-bottom:6px;margin-top:40px}}
+.summary{{display:flex;gap:20px;margin:24px 0}}
+.card{{background:#fff;border-radius:8px;padding:20px 28px;box-shadow:0 1px 4px rgba(0,0,0,.1);text-align:center}}
+.num{{font-size:2.4rem;font-weight:700}}.lbl{{font-size:.85rem;color:#6c757d;margin-top:4px}}
+.pass{{color:#28a745}}.fail{{color:#dc3545}}.tot{{color:#343a40}}
+table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;
+       overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.1);margin-bottom:24px}}
+th{{background:#343a40;color:#fff;padding:10px 14px;text-align:left;font-size:.85rem}}
+td{{padding:10px 14px;border-bottom:1px solid #dee2e6;font-size:.88rem;vertical-align:top}}
+pre{{background:#f1f3f5;padding:16px;border-radius:6px;font-size:.8rem;overflow-x:auto;
+     max-height:350px;white-space:pre-wrap}}
+</style></head><body>
+<h1>🧪 Query Test Report</h1>
+<p><strong>SQL:</strong> <code>{sql_path}</code><br>
+<strong>Test dataset:</strong> <code>{PROJECT_ID}.{TEST_DATASET}</code><br>
+<strong>Generated:</strong> {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
+<div class="summary">
+  <div class="card"><div class="num tot">{total}</div><div class="lbl">Total</div></div>
+  <div class="card"><div class="num pass">{passed}</div><div class="lbl">Passed</div></div>
+  <div class="card"><div class="num fail">{failed}</div><div class="lbl">Failed</div></div>
+  <div class="card"><div class="num {'pass' if pct==100 else 'fail'}">{pct}%</div>
+    <div class="lbl">Pass Rate</div></div>
+</div>
+{overall}{sections}
+<h2>Schema (from INFORMATION_SCHEMA)</h2><pre>{manifest}</pre>
+<h2>SQL Run Against Test Data</h2><pre>{test_sql}</pre>
+</body></html>"""
+
+    try:
+        sql_stem = sql_path.replace("/", "_").replace(".sql", "")
+        blob_name = f"test_reports/{sql_stem}_report.html"
+        storage_client.bucket(BUCKET_NAME).blob(blob_name).upload_from_string(
+            html, content_type="text/html"
+        )
+        gcs_path = f"gs://{BUCKET_NAME}/{blob_name}"
+        logger.info(f"Test report uploaded: {gcs_path}")
+        return gcs_path
+    except Exception:
+        logger.exception("Failed to upload test report to GCS (non-fatal)")
+        return None
+
+
+@app.route("/test", methods=["POST"])
+def run_tests():
+    """Generate synthetic test data from the real BQ schema, run the
+    SQL against it, validate results, upload an HTML report to GCS.
+
+    Body (JSON):
+      sql_path      — relative path, e.g. "resources/sql/portfolio_stress_test.sql"
+      sql_text      — the SQL to test (optimized version recommended)
+      dry_run       — if true, return generated test cases without touching BQ
+    """
+    payload = flask.request.get_json(silent=True) or {}
+    sql_path = payload.get("sql_path", "unknown.sql")
+    sql_text = payload.get("sql_text", "")
+    dry_run = payload.get("dry_run", False)
+
+    if not sql_text:
+        return flask.jsonify({"status": "error", "message": "sql_text is required"}), 400
+
+    try:
+        # Step 1: fetch real schema via the same function the guardrail uses
+        manifest = build_schema_manifest(sql_text)
+        schemas = _parse_manifest_to_schema(manifest)
+        if not schemas:
+            return flask.jsonify({"status": "error",
+                                  "message": "No tables found in manifest"}), 400
+        schema_block = _schema_to_block(schemas)
+
+        # Step 2: ask Gemini to generate test cases from the real schema
+        test_cases = _generate_test_cases(sql_text, schema_block)
+        logger.info(f"Generated {len(test_cases)} test cases for {sql_path}")
+
+        if dry_run:
+            return flask.jsonify({
+                "status": "dry_run",
+                "sql_path": sql_path,
+                "test_cases": test_cases,
+                "summary": {cat: sum(1 for t in test_cases if t["category"] == cat)
+                            for cat in ("positive", "negative", "edge")},
+            })
+
+        # Step 3: create test tables mirroring real schema
+        table_mapping = _setup_test_tables(schemas)
+
+        # Step 4: load synthetic rows
+        _load_test_data(test_cases, table_mapping)
+
+        # Step 5: rewrite SQL to point at test dataset and run it
+        test_sql = _rewrite_to_test_dataset(sql_text)
+        time.sleep(5)   # allow streaming inserts to settle
+        actual_rows = [dict(r) for r in bq_client.query(test_sql).result()]
+        logger.info(f"Test query returned {len(actual_rows)} row(s)")
+
+        # Step 6: validate
+        results = _validate_test_cases(test_cases, actual_rows)
+        passed = sum(1 for r in results if r["passed"])
+
+        # Step 7: upload HTML report to GCS
+        report_gcs_path = _upload_test_report_html(results, sql_path, test_sql, manifest)
+
+        return flask.jsonify({
+            "status": "ok",
+            "sql_path": sql_path,
+            "test_dataset": f"{PROJECT_ID}.{TEST_DATASET}",
+            "total": len(results),
+            "passed": passed,
+            "failed": len(results) - passed,
+            "pass_rate_pct": round(passed / len(results) * 100) if results else 0,
+            "results": results,
+            "report_gcs_path": report_gcs_path,
+        })
+
+    except Exception:
+        logger.exception(f"Test harness failed for {sql_path}")
+        return flask.jsonify({"status": "error",
+                              "message": "Test harness failed — check logs"}), 500
 
 
 @app.route("/api/latest-report", methods=["GET"])
