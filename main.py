@@ -51,7 +51,7 @@ PROJECT_ID = os.environ["PROJECT_ID"]
 LOCATION = os.environ.get("LOCATION", "us-central1")
 
 
-BUCKET_NAME = "sql-review-ui-report"
+eBUCKET_NAME = "sql-review-ui-report"
 DEFAULT_REPO_URL = os.environ.get("DEFAULT_REPO_URL")
 BYTES_PER_GB = 1024 ** 3
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
@@ -1382,69 +1382,155 @@ def parse_gemini_json(rewrite: str, fallback_sql: str) -> dict:
 # and can't miss a bug because retrieval only grabbed part of a file.
 # =================================================================
 def detect_type_risks(beam_dir_context: str, consumer_file: str, schema_manifest: str) -> list:
-    """STRING-in-arithmetic and NULLABLE-in-arithmetic detector. No LLM
-    involved — walks the whole file, so helper functions are covered too."""
+    """Static risk detector — no LLM. Scans ALL Beam files (not just the
+    consumer) so helper functions in sibling files are also covered.
+
+    Detects:
+      HIGH   — STRING/BYTES column in arithmetic or numeric comparison
+      HIGH   — STRING column passed to int()/float()/numeric conversion
+      MEDIUM — NULLABLE column in arithmetic/comparison without None guard
+      MEDIUM — NULLABLE column as divisor (None → TypeError in division)
+      LOW    — STRING column in == / != comparison (logic bug, not a crash;
+               Python silently returns False instead of raising)
+    """
     types = dict(re.findall(r"^- (\w+) \((\w+)\)", schema_manifest, re.MULTILINE))
     nullable_cols = set(re.findall(r"^- (\w+) \([^)]+\) \[NULLABLE\]", schema_manifest, re.MULTILINE))
 
-    m = re.search(rf"--- {re.escape(consumer_file)} ---\n(.*?)(?=\n--- |\Z)",
-                  beam_dir_context, re.DOTALL)
-    if not m:
-        return []
+    # Scan ALL Beam files, not just the consumer — helper functions in
+    # sibling files that also touch row["col"] are covered this way.
+    # We tag each risk with the file it was found in.
+    file_blocks = re.findall(
+        r"--- (.+?) ---\n(.*?)(?=\n--- |\Z)", beam_dir_context, re.DOTALL
+    )
+    if not file_blocks:
+        # Fallback: try single-file pattern (consumer file only)
+        m = re.search(rf"--- {re.escape(consumer_file)} ---\n(.*?)(?=\n--- |\Z)",
+                      beam_dir_context, re.DOTALL)
+        file_blocks = [(consumer_file, m.group(1))] if m else []
 
     risks, seen = [], set()
+    NUMERIC_CONVERSIONS = {"int", "float", "round", "abs", "divmod", "pow"}
 
-    class Visitor(ast.NodeVisitor):
-        def _cols(self, node):
-            """row["col"] subscripts anywhere in this expression."""
-            return [n.slice.value for n in ast.walk(node)
-                    if isinstance(n, ast.Subscript)
-                    and isinstance(n.slice, ast.Constant)
-                    and isinstance(n.slice.value, str)]
+    for fname, source in file_blocks:
+        class Visitor(ast.NodeVisitor):
+            def _cols(self, node):
+                """All row["col"] subscripts anywhere inside this node."""
+                return [n.slice.value for n in ast.walk(node)
+                        if isinstance(n, ast.Subscript)
+                        and isinstance(n.slice, ast.Constant)
+                        and isinstance(n.slice.value, str)]
 
-        def _flag(self, node, kind):
-            for col in self._cols(node):
-                t = types.get(col)
-                if t in ("STRING", "BYTES") and col not in seen:
-                    seen.add(col)
-                    risks.append({
-                        "severity": "HIGH",
-                        "beam_file": consumer_file,
-                        "column": col,
-                        "issue": f"{col} is {t} in BigQuery but used in {kind} in Python",
-                        "detail": f"`{ast.unparse(node)}` raises TypeError — "
-                                  f"Python does not implicitly convert {t} to a number.",
-                        "fix": f"CAST({col} AS INT64/FLOAT64) in the SQL SELECT list, "
-                               f"or convert in Beam before use.",
-                    })
-                elif col in nullable_cols and col not in seen:
-                    seen.add(col)
-                    risks.append({
-                        "severity": "MEDIUM",
-                        "beam_file": consumer_file,
-                        "column": col,
-                        "issue": f"{col} is NULLABLE in BigQuery but used in {kind} without a None check",
-                        "detail": f"`{ast.unparse(node)}` will raise TypeError when {col} is NULL — "
-                                  f"BigQuery returns None for NULLABLE columns and Python cannot use "
-                                  f"None in arithmetic or comparisons.",
-                        "fix": f"Guard with `if row['{col}'] is not None` before use, "
-                               f"or use `COALESCE({col}, 0)` in the SQL to guarantee a non-null value.",
-                    })
+            def _flag(self, node, kind, severity="HIGH"):
+                for col in self._cols(node):
+                    key = (col, kind)
+                    if key in seen:
+                        continue
+                    t = types.get(col)
+                    if t in ("STRING", "BYTES"):
+                        seen.add(key)
+                        risks.append({
+                            "severity": severity,
+                            "beam_file": fname,
+                            "column": col,
+                            "issue": f"{col} is {t} in BigQuery but used in {kind} in Python",
+                            "detail": f"`{ast.unparse(node)}` raises TypeError — "
+                                      f"Python does not implicitly convert {t} to a number.",
+                            "fix": f"CAST({col} AS INT64/FLOAT64) in the SQL SELECT list, "
+                                   f"or convert in Beam before use.",
+                        })
+                    elif col in nullable_cols:
+                        seen.add(key)
+                        risks.append({
+                            "severity": "MEDIUM",
+                            "beam_file": fname,
+                            "column": col,
+                            "issue": f"{col} is NULLABLE in BigQuery but used in {kind} without a None check",
+                            "detail": f"`{ast.unparse(node)}` will raise TypeError when {col} is NULL — "
+                                      f"BigQuery returns None for NULLABLE columns.",
+                            "fix": f"Guard with `if row['{col}'] is not None` before use, "
+                                   f"or use `COALESCE({col}, 0)` in the SQL.",
+                        })
 
-        def visit_BinOp(self, node):
-            if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
-                self._flag(node, "arithmetic")
-            self.generic_visit(node)
+            def visit_BinOp(self, node):
+                if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+                    self._flag(node, "arithmetic")
+                elif isinstance(node.op, ast.Div):
+                    self._flag(node, "arithmetic")
+                    # Additionally flag NULLABLE columns used as the DIVISOR —
+                    # dividing by None raises TypeError even when the numerator
+                    # is fine. Check right-hand side of the division only.
+                    for col in self._cols(node.right):
+                        key = (col, "division-by-nullable")
+                        if key not in seen and col in nullable_cols:
+                            seen.add(key)
+                            risks.append({
+                                "severity": "MEDIUM",
+                                "beam_file": fname,
+                                "column": col,
+                                "issue": f"{col} is NULLABLE and used as a divisor — will TypeError when NULL",
+                                "detail": f"`{ast.unparse(node)}` — Python raises TypeError when "
+                                          f"dividing by None. {col} is NULLABLE in BigQuery.",
+                                "fix": f"Use `COALESCE({col}, 1)` in SQL or guard with "
+                                       f"`if row['{col}'] else <default>` in Beam.",
+                            })
+                self.generic_visit(node)
 
-        def visit_Compare(self, node):
-            if any(isinstance(o, (ast.Gt, ast.Lt, ast.GtE, ast.LtE)) for o in node.ops):
-                self._flag(node, "numeric comparison")
-            self.generic_visit(node)
+            def visit_Compare(self, node):
+                # Numeric comparisons (>, <, >=, <=) — crash with TypeError on STRING
+                if any(isinstance(o, (ast.Gt, ast.Lt, ast.GtE, ast.LtE)) for o in node.ops):
+                    self._flag(node, "numeric comparison")
+                # Equality (==, !=) on STRING — silent logic bug, not a crash
+                if any(isinstance(o, (ast.Eq, ast.NotEq)) for o in node.ops):
+                    for col in self._cols(node):
+                        key = (col, "equality comparison")
+                        if key not in seen and types.get(col) in ("STRING", "BYTES"):
+                            seen.add(key)
+                            risks.append({
+                                "severity": "LOW",
+                                "beam_file": fname,
+                                "column": col,
+                                "issue": f"{col} is STRING in BigQuery but compared with == / != to a number",
+                                "detail": f"`{ast.unparse(node)}` — Python silently returns False "
+                                          f"when comparing STRING to int/float (no crash, but always wrong). "
+                                          f"e.g. `'36' == 36` is False in Python.",
+                                "fix": f"CAST({col} AS INT64/FLOAT64) in the SQL SELECT list "
+                                       f"before comparing, or compare to a string literal instead.",
+                            })
+                self.generic_visit(node)
 
-    try:
-        Visitor().visit(ast.parse(m.group(1)))
-    except SyntaxError:
-        logger.warning(f"Could not parse {consumer_file}")
+            def visit_Call(self, node):
+                # int(row["col"]), float(row["col"]) etc. on STRING columns
+                # can raise ValueError if the string isn't cleanly numeric
+                # (e.g. "94107-1234", "35 months", "n/a")
+                func_name = (
+                    node.func.id if isinstance(node.func, ast.Name)
+                    else node.func.attr if isinstance(node.func, ast.Attribute)
+                    else None
+                )
+                if func_name in NUMERIC_CONVERSIONS:
+                    for arg in node.args:
+                        for col in self._cols(arg):
+                            key = (col, f"{func_name}() conversion")
+                            if key not in seen and types.get(col) in ("STRING", "BYTES"):
+                                seen.add(key)
+                                risks.append({
+                                    "severity": "HIGH",
+                                    "beam_file": fname,
+                                    "column": col,
+                                    "issue": f"{col} is STRING — {func_name}(row['{col}']) raises ValueError if not cleanly numeric",
+                                    "detail": f"`{ast.unparse(node)}` — {func_name}() raises ValueError "
+                                              f"for strings like '35 months', '94107-1234', 'n/a', or empty string. "
+                                              f"{col} is stored as STRING in BigQuery with no format guarantee.",
+                                    "fix": f"CAST({col} AS INT64/FLOAT64) in the SQL SELECT list to let "
+                                           f"BigQuery handle the conversion (it raises a query error on bad values "
+                                           f"rather than crashing individual Beam records), or wrap in try/except.",
+                                })
+                self.generic_visit(node)
+
+        try:
+            Visitor().visit(ast.parse(source))
+        except SyntaxError:
+            logger.warning(f"Could not parse {fname}")
 
     return risks
 
