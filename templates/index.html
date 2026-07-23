@@ -428,6 +428,12 @@ function renderBanner(d) {
 
 /* ── Render: Query cards ────────────────────────────────── */
 function renderQueries(queries) {
+  // Store SQL outside the DOM so onclick doesn't need to inline it
+  window._queryMeta = {};
+  queries.forEach(q => {
+    window._queryMeta[q.query_id] = { file_name: q.file_name, optimized_sql: q.optimized_sql || '' };
+  });
+
   const host = document.getElementById('queryList');
   host.innerHTML = queries.map((q, i) => {
     const annualOrig = q.original_cost_per_run * q.runs_per_day * 365;
@@ -561,7 +567,7 @@ function renderQueries(queries) {
                 <span class="text-[11px] font-medium text-indigo-400 uppercase tracking-[0.09em]">Test data harness</span>
               </div>
               <button id="testBtn-${q.query_id}"
-                onclick="runQueryTest(event, '${q.query_id}', ${JSON.stringify(q.file_name)}, ${JSON.stringify(q.optimized_sql || '')})"
+                onclick="runQueryTest(event, '${q.query_id}')"
                 class="flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-900/60 hover:bg-indigo-800/70 border border-indigo-700/50 text-indigo-200 text-[12px] font-medium transition active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed">
                 <i data-lucide="play" class="w-3.5 h-3.5"></i>
                 Run Tests
@@ -749,8 +755,12 @@ async function scanRepository() {
   }
 }
 
-async function runQueryTest(event, queryId, fileName, optimizedSql) {
+async function runQueryTest(event, queryId) {
   event.stopPropagation();
+  const meta = (window._queryMeta || {})[queryId] || {};
+  const fileName = meta.file_name || queryId;
+  const optimizedSql = meta.optimized_sql || '';
+
   const btn = document.getElementById(`testBtn-${queryId}`);
   const resultBox = document.getElementById(`testResult-${queryId}`);
   const resultInner = document.getElementById(`testResultInner-${queryId}`);
