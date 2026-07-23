@@ -1,0 +1,7 @@
+sql_query,matched_function,matched_file,combined_score,containment,cosine_sim,runner_up_function,runner_up_file,runner_up_combined_score,margin,ambiguous
+customer_risk_dashboard.sql,is_stress_candidate,stress_test.py,0.926,1.0,0.506,is_meaningful_exposure,dashboard.py,0.922,0.004,True
+delinquency_alerts.sql,format_delinquency_alert,delinquency_alerts.py,0.642,0.6,0.878,is_severe_delinquency,delinquency_alerts.py,0.525,0.117,False
+employer_concentration.sql,format_employer_row,employer_concentration.py,0.37,0.333,0.579,format_delinquency_alert,delinquency_alerts.py,0.263,0.108,False
+high_risk_watchlist.sql,is_stress_candidate,stress_test.py,0.93,1.0,0.53,is_meaningful_exposure,dashboard.py,0.926,0.003,True
+portfolio_stress_test.sql,format_delinquency_alert,delinquency_alerts.py,0.973,1.0,0.823,is_stress_candidate,stress_test.py,0.923,0.051,False
+retail_lending_portfolio.sql,format_rm_report,rm_report.py,0.996,1.0,0.971,clean_row,cleaning.py,0.978,0.018,True
