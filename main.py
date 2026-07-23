@@ -2127,6 +2127,10 @@ def _create_test_table(table_ref: str, schema: dict[str, str]) -> str:
         for col, bq_type in schema.items()
     ]
     bq_client.delete_table(test_table_id, not_found_ok=True)
+    # BQ needs a moment to propagate a deletion before the same table
+    # can be recreated — skip this and streaming inserts 404 on the
+    # newly-created table (known BQ delete+recreate race condition).
+    time.sleep(1)
     bq_client.create_table(bigquery.Table(test_table_id, schema=fields))
     return test_table_id
 
@@ -2150,12 +2154,21 @@ def _load_test_data(test_cases: list[dict], table_mapping: dict[str, str]):
                 cleaned = [{k: v for k, v in r.items() if v is not None} for r in rows]
                 rows_by_table.setdefault(test_id, []).extend(cleaned)
     for test_id, rows in rows_by_table.items():
-        if rows:
-            errs = bq_client.insert_rows_json(test_id, rows)
-            if errs:
-                logger.warning(f"Insert errors in {test_id}: {errs}")
-            else:
-                logger.info(f"Loaded {len(rows)} rows → {test_id}")
+        if not rows:
+            continue
+        # Use a load job (not streaming inserts) — load jobs are synchronous
+        # (.result() blocks until data is committed) so the subsequent SELECT
+        # always sees the rows, with no delete+recreate race condition.
+        job_config = bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        )
+        job = bq_client.load_table_from_json(rows, test_id, job_config=job_config)
+        job.result()  # wait for load to complete before returning
+        if job.errors:
+            logger.warning(f"Load job errors for {test_id}: {job.errors}")
+        else:
+            logger.info(f"Loaded {len(rows)} rows → {test_id} (load job)")
 
 
 def _rewrite_to_test_dataset(sql_text: str) -> str:
@@ -2337,17 +2350,8 @@ def run_tests():
         logger.info(f"[TEST] Step 4 done")
 
         # Step 5: rewrite SQL to point at test dataset and run it.
-        # Streaming inserts have eventual consistency — poll until rows
-        # appear or give up after 30s rather than sleeping a fixed 5s.
+        # Load jobs (used above) are synchronous — no polling needed.
         test_sql = _rewrite_to_test_dataset(sql_text)
-        first_table_id = next(iter(table_mapping.values()))
-        for _ in range(6):
-            time.sleep(3)
-            probe = list(bq_client.query(
-                f"SELECT COUNT(*) as n FROM `{first_table_id}`"
-            ).result())
-            if probe and probe[0].n > 0:
-                break
         actual_rows = [dict(r) for r in bq_client.query(test_sql).result()]
         logger.info(f"Test query returned {len(actual_rows)} row(s)")
 
