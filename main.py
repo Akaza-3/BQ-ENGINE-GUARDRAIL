@@ -169,8 +169,9 @@ def clone_and_diff(repo_clone_url: str, before_sha: str, after_sha: str):
         results.append({"path": path, "old": old_content, "new": new_content})
 
     beam_context, beam_filenames = _read_beam_dir(tmp_dir)
+    committed_schemas = read_committed_avro_schemas(tmp_dir)
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    return results, beam_context, beam_filenames, commit_message
+    return results, beam_context, beam_filenames, commit_message, committed_schemas
 
 
 def clone_all_sql(repo_clone_url: str, ref: str = "main"):
@@ -198,8 +199,9 @@ def clone_all_sql(repo_clone_url: str, ref: str = "main"):
                     })
 
     beam_context, beam_filenames = _read_beam_dir(tmp_dir)
+    committed_schemas = read_committed_avro_schemas(tmp_dir)
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    return results, beam_context, beam_filenames, head_sha
+    return results, beam_context, beam_filenames, head_sha, committed_schemas
 
 
 # =================================================================
@@ -865,6 +867,370 @@ def retrieve_consumer_context(sql_text: str, index: list[dict], fallback_file: s
 
 
 # =================================================================
+# Avro schema risk detection
+#
+# Real-world shape this mirrors: the Beam pipeline is the last stop
+# before a record gets written to GCS as Avro, so the Beam formatter's
+# output dict effectively IS the Avro schema in production. This check
+# never executes SQL or Beam (same fail-open, static-analysis-only
+# policy as the rest of the app) — it compares two things it can both
+# derive without running anything:
+#
+#   1. "Expected" Avro schema  — every column BigQuery says this
+#      query's source tables have, mapped to its Avro type. What
+#      COULD be delivered.
+#   2. "Dataset resulting from the Beam pipeline" — the resolved
+#      consumer's primary formatter function's `return {...}` dict,
+#      statically resolved field-by-field back to the row["col"]
+#      expression(s) that build each value. What the Beam code
+#      actually COMMITS to delivering, read from its source rather
+#      than executed.
+#
+# A field in (2) whose source column isn't in (1) means the SQL no
+# longer produces something the Avro record still promises — that
+# will KeyError in production before Avro serialization ever runs.
+# Flagged as a HIGH risk, in the exact same shape as the existing
+# STRING-in-arithmetic risks, so it shows up in the same "Type Risks"
+# section rather than needing its own UI plumbing.
+# =================================================================
+def _select_primary_function(file_source: str) -> dict | None:
+    """Within one Beam file, picks the function most likely to be the
+    actual output-record builder (the one whose return dict becomes
+    the Avro record) rather than a filter/predicate helper.
+
+    Heuristic: the row-consuming function with the LARGEST column
+    signature, name prefix as a tie-break. Same insight the file-level
+    RAG fix relies on — a predicate needs a handful of columns to
+    decide keep/drop, a formatter needs most/all of them to build the
+    output record, so column-count is a reliable proxy for "this is
+    the formatter" without needing a naming convention to hold.
+    """
+    try:
+        tree = ast.parse(file_source)
+    except SyntaxError:
+        return None
+
+    candidates = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and _consumes_row(node):
+            snippet = ast.get_source_segment(file_source, node)
+            if snippet and snippet.strip():
+                candidates.append({
+                    "name": node.name,
+                    "source": snippet,
+                    "columns": _row_columns(snippet),
+                })
+    if not candidates:
+        return None
+
+    def sort_key(c):
+        name_bonus = 1 if re.match(r"^(format_|build_|to_|make_)", c["name"]) else 0
+        return (len(c["columns"]), name_bonus)
+
+    candidates.sort(key=sort_key, reverse=True)
+    return candidates[0]
+
+
+def _bq_type_to_avro(bq_type: str) -> str:
+    """Best-effort BigQuery -> Avro primitive type mapping, covering
+    the types this repo's tables actually use. Anything unrecognized
+    falls back to "string" (Avro's most permissive type) so a mapping
+    gap produces an overly-lenient comparison rather than a crash."""
+    mapping = {
+        "STRING": "string", "BYTES": "bytes",
+        "INT64": "long", "INTEGER": "long",
+        "FLOAT64": "double", "FLOAT": "double",
+        "NUMERIC": "double", "BIGNUMERIC": "double",
+        "BOOL": "boolean", "BOOLEAN": "boolean",
+        "TIMESTAMP": "long", "DATE": "string",
+        "DATETIME": "string", "TIME": "string",
+    }
+    return mapping.get(bq_type.upper(), "string")
+
+
+def build_expected_avro_schema(sql_text: str, schema_manifest: str) -> dict:
+    """Step 1: {column_name: avro_type}, one entry per column the QUERY
+    actually outputs, typed via its declared BigQuery type. Reuses the
+    same whole-word, CAST-aware extraction RAG retrieval already
+    validated (_extract_query_columns) — deliberately NOT "every
+    column the underlying table has": schema_manifest comes from
+    INFORMATION_SCHEMA on the source TABLE, which still lists a column
+    even after a rewrite prunes it from the SELECT list. The whole
+    point of this check is to catch exactly that drift (a SQL rewrite
+    quietly dropping a column Beam still expects), so "expected" has
+    to mean "what this query currently selects," not "what the table
+    has.\""""
+    query_cols = set(_extract_query_columns(sql_text, schema_manifest))
+    types = dict(re.findall(r"^- (\w+) \((\w+)\)", schema_manifest, re.MULTILINE))
+    return {c: _bq_type_to_avro(types[c]) for c in query_cols if c in types}
+
+
+def build_beam_output_fields(primary_function: dict) -> dict | None:
+    """Step 2: "the dataset resulting from the beam pipeline" — parses
+    the primary formatter's `return {...}` dict literal and maps each
+    output key to the row["col"] column(s) feeding its value. Not
+    executed data; the field-by-field shape the function's source
+    statically commits to producing, consistent with this app never
+    running Beam code, only reading it.
+
+    Returns None if the function has no dict-literal return (e.g. it
+    returns a pre-built object) — the caller treats that as "not
+    applicable," not a mismatch.
+    """
+    try:
+        tree = ast.parse(primary_function["source"])
+    except SyntaxError:
+        return None
+
+    func_node = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)), None)
+    if not func_node:
+        return None
+
+    return_dict = None
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+            return_dict = node.value
+            break
+    if return_dict is None:
+        return None
+
+    # Resolve one level of local-variable indirection. A common real
+    # pattern (e.g. dashboard.py's format_dashboard_row): compute a
+    # derived value once, name it, then return the name —
+    # `effective_rate = row["emp_length"] * 0.05; return
+    # {"effective_rate": effective_rate, ...}`. The dict VALUE there is
+    # a bare Name, not a Subscript, so without this the source column
+    # would be invisible to the comparison below — silently treating a
+    # real dependency as "computed, nothing to check." One level of
+    # lookup catches this without needing full data-flow analysis.
+    local_assigns = {}
+    for node in ast.walk(func_node):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)):
+            local_assigns[node.targets[0].id] = node.value
+
+    def resolve_cols(node):
+        if isinstance(node, ast.Name) and node.id in local_assigns:
+            node = local_assigns[node.id]
+        return [n.slice.value for n in ast.walk(node)
+                if isinstance(n, ast.Subscript)
+                and isinstance(n.slice, ast.Constant)
+                and isinstance(n.slice.value, str)]
+
+    fields = {}
+    for key_node, value_node in zip(return_dict.keys, return_dict.values):
+        if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+            continue
+        fields[key_node.value] = resolve_cols(value_node)
+    return fields
+
+
+def build_avro_schema_document(expected_schema: dict, record_name: str) -> dict:
+    """Turns {column: avro_type} into an actual, valid Avro schema
+    document — the literal .avsc content a real Avro-to-GCS delivery
+    would carry, not just an internal comparison structure. Every
+    field is nullable (["null", type]) since BigQuery columns default
+    to NULLABLE and schema_manifest doesn't currently track REQUIRED
+    per-column — a documented simplification, not a hidden one."""
+    return {
+        "type": "record",
+        "name": record_name,
+        "namespace": "bq_devops_cost_guardrail",
+        "fields": [
+            {"name": col, "type": ["null", avro_type], "default": None}
+            for col, avro_type in sorted(expected_schema.items())
+        ],
+    }
+
+
+def upload_avro_schema(schema_doc: dict, query_path: str) -> str | None:
+    """Writes the generated .avsc to GCS — a real file you can open,
+    not just numbers in a report — mirroring how this repo's real
+    Avro-to-GCS delivery would publish its schema alongside the data.
+    Fails open: this is an inspection artifact, it should never block
+    analysis if the upload itself fails."""
+    try:
+        blob_name = f"avro_schemas/{query_path.replace('/', '_')}.avsc"
+        storage_client.bucket(BUCKET_NAME).blob(blob_name).upload_from_string(
+            json.dumps(schema_doc, indent=2), content_type="application/json"
+        )
+        gcs_path = f"gs://{BUCKET_NAME}/{blob_name}"
+        logger.info(f"Uploaded generated Avro schema to {gcs_path}")
+        return gcs_path
+    except Exception:
+        logger.exception(f"Failed to upload Avro schema for {query_path} (non-fatal)")
+        return None
+
+
+def read_committed_avro_schemas(tmp_dir: str) -> dict:
+    """Read every .avsc from resources/avro/ in the cloned repo.
+    Returns {query_name: avsc_doc} where query_name is the SQL filename
+    without extension (e.g. 'customer_risk_dashboard').
+    Returns {} if the directory doesn't exist — fails open, never blocks analysis."""
+    avro_dir = os.path.join(tmp_dir, "resources", "avro")
+    schemas = {}
+    if not os.path.isdir(avro_dir):
+        logger.info("No resources/avro/ directory found in repo — committed schema check disabled")
+        return schemas
+    for fname in sorted(os.listdir(avro_dir)):
+        if fname.endswith(".avsc"):
+            path = os.path.join(avro_dir, fname)
+            try:
+                with open(path) as f:
+                    schemas[fname[:-5]] = json.load(f)
+                logger.info(f"Loaded committed Avro schema: {fname}")
+            except Exception as e:
+                logger.warning(f"Could not load committed schema {fname}: {e}")
+    return schemas
+
+
+def check_committed_avro_contract(primary_function: dict | None, consumer_file: str,
+                                   query_path: str, committed_schemas: dict) -> list:
+    """Compare the committed .avsc contract (resources/avro/) against what
+    the current Beam formatter actually produces.
+
+    The committed .avsc is the authoritative schema contract for what the
+    Beam pipeline must deliver. This check catches two classes of drift:
+
+      HIGH — Fields the contract declares but the formatter no longer
+              returns. Downstream Avro readers will break on these.
+      LOW  — Fields the formatter produces that aren't in the contract.
+              Schema is stale and needs updating.
+
+    This is complementary to check_avro_schema_risk(), which verifies the
+    SQL→Beam direction (source columns still exist in the query output).
+    This function guards the Beam→contract direction."""
+    query_name = os.path.basename(query_path).replace(".sql", "")
+    committed = committed_schemas.get(query_name)
+    if not committed:
+        logger.info(f"No committed .avsc for '{query_name}' — skipping contract check")
+        return []
+
+    committed_fields = {f["name"] for f in committed.get("fields", [])}
+
+    if primary_function is None:
+        logger.info(f"No primary function for {query_path} — skipping contract check")
+        return []
+
+    beam_fields = build_beam_output_fields(primary_function)
+    if beam_fields is None:
+        return []
+    beam_output_keys = set(beam_fields.keys())
+
+    avsc_path = f"resources/avro/{query_name}.avsc"
+    risks = []
+
+    for field in sorted(committed_fields - beam_output_keys):
+        risks.append({
+            "severity": "HIGH",
+            "beam_file": consumer_file,
+            "column": field,
+            "issue": f"Contracted Avro field '{field}' is no longer produced by {consumer_file}",
+            "detail": (f"{avsc_path} declares '{field}' as a required output field, "
+                       f"but the current {consumer_file} formatter does not return it. "
+                       f"Downstream Avro readers expecting this field will fail."),
+            "fix": (f"Restore '{field}' to the formatter's return dict in {consumer_file}, "
+                    f"or remove it from {avsc_path} if the field is intentionally retired."),
+        })
+
+    for field in sorted(beam_output_keys - committed_fields):
+        risks.append({
+            "severity": "LOW",
+            "beam_file": consumer_file,
+            "column": field,
+            "issue": f"Beam output field '{field}' is not declared in {avsc_path}",
+            "detail": (f"{consumer_file} produces '{field}' but {avsc_path} does not declare it. "
+                       f"Avro readers relying on the committed schema won't know this field exists."),
+            "fix": f"Add '{field}' to {avsc_path} to keep the contract current.",
+        })
+
+    high = sum(1 for r in risks if r["severity"] == "HIGH")
+    low = sum(1 for r in risks if r["severity"] == "LOW")
+    if risks:
+        logger.info(f"{query_path}: contract check — {high} HIGH, {low} LOW violations vs {avsc_path}")
+    else:
+        logger.info(f"{query_path}: committed Avro contract fully satisfied by {consumer_file}")
+    return risks
+
+
+def check_avro_schema_risk(sql_text: str, schema_manifest: str, consumer_file: str,
+                           beam_sources: dict, query_path: str,
+                           committed_schemas: dict | None = None) -> dict:
+    """Step 1+2+3 together: generates the expected .avsc, resolves the
+    Beam-pipeline output fields, compares them, and flags mismatches
+    as risks on this query. `sql_text` should be the OPTIMIZED SQL —
+    the query as it will actually run — since the entire point is
+    catching a rewrite that drops a column Beam still depends on.
+
+    Returns {"risks": [...], "status": "...", "schema_doc": {...} or
+    None, "schema_gcs_path": "gs://..." or None}. schema_doc/
+    schema_gcs_path are only None when the check couldn't run at all
+    (no consumer resolved, no dict-literal return) — see `status` for
+    why. Fails open at every step rather than raising, so a pipeline
+    this check can't cleanly analyze just gets skipped instead of
+    breaking analysis for that query."""
+    empty = {"risks": [], "status": "", "schema_doc": None, "schema_gcs_path": None}
+
+    file_source = beam_sources.get(consumer_file, "")
+    if not file_source:
+        return {**empty, "status": "N/A — no Beam consumer resolved for this query"}
+
+    primary = _select_primary_function(file_source)
+    if not primary:
+        return {**empty, "status": "N/A — no row-building function found in this consumer"}
+
+    beam_fields = build_beam_output_fields(primary)
+    if beam_fields is None:
+        return {**empty, "status": f"N/A — {primary['name']}() doesn't return a plain dict literal"}
+
+    # Step 1: generate the expected schema FIRST, as its own real
+    # artifact — independent of whether Beam turns out to match it.
+    expected_schema = build_expected_avro_schema(sql_text, schema_manifest)
+    schema_doc = build_avro_schema_document(expected_schema, primary["name"])
+    gcs_path = upload_avro_schema(schema_doc, query_path)
+
+    # Step 2 (beam_fields, above) vs Step 1 (expected_schema): compare.
+    risks = []
+    matched = 0
+    for field, source_cols in beam_fields.items():
+        if not source_cols:
+            # Computed/constant/helper-derived field (e.g. a boolean
+            # flag from a predicate call, or a literal) — nothing in
+            # the query schema to check it against, not a risk.
+            matched += 1
+            continue
+        missing = [c for c in source_cols if c not in expected_schema]
+        if missing:
+            risks.append({
+                "severity": "HIGH",
+                "beam_file": consumer_file,
+                "column": ", ".join(missing),
+                "issue": f"Avro field '{field}' references column(s) "
+                         f"{missing} not present in this query's output",
+                "detail": f"{primary['name']}() builds \"{field}\" from "
+                          f"row[{missing[0]!r}], but the current SELECT "
+                          f"list doesn't produce {missing[0]!r} — this "
+                          f"will KeyError before the record is ever "
+                          f"serialized to Avro, not just mis-serialize it.",
+                "fix": f"Add {missing} back to the SQL SELECT list, or "
+                       f"remove '{field}' from {primary['name']}() if the "
+                       f"field is no longer needed downstream.",
+            })
+        else:
+            matched += 1
+
+    # Check committed .avsc contract (Beam→contract direction)
+    if committed_schemas:
+        contract_risks = check_committed_avro_contract(primary, consumer_file, query_path, committed_schemas)
+        risks = risks + contract_risks
+
+    total = len(beam_fields)
+    summary = (f"{matched}/{total} Avro fields matched ({primary['name']}() "
+               f"in {consumer_file})") if total else "No output fields detected"
+    return {"risks": risks, "status": summary, "schema_doc": schema_doc, "schema_gcs_path": gcs_path}
+
+
+# =================================================================
 # Gemini
 # =================================================================
 def ask_gemini_for_rewrite(old_sql, new_sql, cache_name, schema_manifest,
@@ -1108,7 +1474,8 @@ to be specific to this query. Return [] if all are rejected.
 # =================================================================
 # Shared analysis core — used by BOTH /review and /analyze
 # =================================================================
-def analyze_one(change: dict, beam_context: str, beam_sources: dict, beam_index: list):
+def analyze_one(change: dict, beam_context: str, beam_sources: dict, beam_index: list,
+                committed_schemas: dict | None = None):
     """Dry run -> RAG consumer lookup -> Gemini rewrite -> dry run ->
     risk detection for one SQL file. Returns (result_dict, cache_info)."""
     new_bytes, _ = dry_run_bytes(change["new"])
@@ -1121,6 +1488,34 @@ def analyze_one(change: dict, beam_context: str, beam_sources: dict, beam_index:
     consumer_context, consumer, matched, confidence = retrieve_consumer_context(
         change["new"], beam_index, fallback_consumer, beam_sources, schema_manifest
     )
+
+    # Cross-validate RAG's pick against the committed .avsc contract.
+    # A wide query (SELECT * with 150+ columns) can give a tiny formatter's
+    # small column set a near-perfect containment score even when it's the
+    # wrong consumer — e.g. delinquency_alerts.py (6 columns) against a
+    # stress-test query that happens to include all 6. The committed .avsc
+    # is the authoritative contract: if the picked consumer's formatter
+    # output keys barely overlap with those contracted fields, RAG guessed
+    # wrong and the config fallback is safer.
+    if matched and committed_schemas:
+        query_name = os.path.basename(change["path"]).replace(".sql", "")
+        avsc_doc = committed_schemas.get(query_name)
+        if avsc_doc:
+            contracted = {f["name"] for f in avsc_doc.get("fields", [])}
+            primary_check = _select_primary_function(beam_sources.get(consumer, ""))
+            beam_keys_check = set(build_beam_output_fields(primary_check) or {}) if primary_check else set()
+            overlap = len(beam_keys_check & contracted) / max(len(contracted), 1)
+            if overlap < 0.3:
+                logger.warning(
+                    f"RAG picked '{consumer}' for {change['path']} but only "
+                    f"{overlap:.0%} field overlap with committed .avsc ({len(contracted)} contracted fields) "
+                    f"— reverting to config fallback '{fallback_consumer}'"
+                )
+                consumer = fallback_consumer
+                consumer_context = beam_sources.get(fallback_consumer, "")
+                matched = False
+                confidence = 0.0
+
     logger.info(
         f"{change['path']}: consumer={consumer!r} "
         f"via={'RAG' if matched else 'config fallback'} confidence={confidence:.2f}"
@@ -1142,6 +1537,21 @@ def analyze_one(change: dict, beam_context: str, beam_sources: dict, beam_index:
     risks = validated if validated else candidates
     logger.info(f"{change['path']}: {len(candidates)} candidates, {len(validated)} confirmed")
 
+    # Avro schema check — independent of the type-risk scan above, but
+    # merged into the same `risks` list so it surfaces in the same
+    # report section without needing separate UI plumbing. Checked
+    # against optimized_sql (not the original) since the point is to
+    # catch the rewrite itself breaking the downstream Avro delivery.
+    # Also writes the generated .avsc to GCS — a real, openable file,
+    # not just a number in the report.
+    avro_result = check_avro_schema_risk(
+        optimized_sql, schema_manifest, consumer, beam_sources, change["path"],
+        committed_schemas=committed_schemas,
+    )
+    risks = risks + avro_result["risks"]
+    logger.info(f"{change['path']}: avro check — {avro_result['status']} "
+                f"(schema: {avro_result['schema_gcs_path']})")
+
     return {
         "path": change["path"],
         "old_bytes": None,
@@ -1159,6 +1569,9 @@ def analyze_one(change: dict, beam_context: str, beam_sources: dict, beam_index:
         "rag_consumer": consumer,
         "rag_matched": matched,
         "rag_confidence": round(confidence, 3),
+        "avro_status": avro_result["status"],
+        "avro_schema": avro_result["schema_doc"],
+        "avro_schema_gcs_path": avro_result["schema_gcs_path"],
     }, cache_info
 
 
@@ -1210,6 +1623,12 @@ def build_comment_section(r: dict, cache_info: dict) -> str:
             f"- Resolved: `{r['rag_consumer']}`\n"
             f"- Method: {method} (confidence {r['rag_confidence']:.2f})\n\n"
         )
+
+    if r.get("avro_status"):
+        section += f"### Avro Schema Check\n- {r['avro_status']}\n"
+        if r.get("avro_schema_gcs_path"):
+            section += f"- Generated schema: `{r['avro_schema_gcs_path']}`\n"
+        section += "\n"
 
     section += (
         f"### Schema Cache\n"
@@ -1298,6 +1717,9 @@ def build_ui_report(branch: str, commit_message: str, changed_results: list,
             "optimized_sql": r["optimized_sql"],
             "ai_explanation": r["summary"],
             "risks": r.get("risks", []),
+            "avro_status": r.get("avro_status", "N/A"),
+            "avro_schema": r.get("avro_schema"),
+            "avro_schema_gcs_path": r.get("avro_schema_gcs_path"),
         })
         all_business_logic.append(r["business_logic"])
 
@@ -1309,6 +1731,27 @@ def build_ui_report(branch: str, commit_message: str, changed_results: list,
         f"{dataset} ({count} Table{'s' if count != 1 else ''})"
         for dataset, count in dataset_counts.items()
     ) or "None"
+
+    # Aggregate the per-query Avro check (see check_avro_schema_risk)
+    # into one summary line. A query's avro_status starts with "N/A"
+    # when the check couldn't run for it (no consumer resolved, no
+    # dict-literal return, etc.) — those don't count toward "checked."
+    avro_checked = [r for r in changed_results
+                    if r.get("avro_status") and not r["avro_status"].startswith("N/A")]
+    avro_mismatch_count = sum(
+        1 for r in changed_results for risk in r.get("risks", [])
+        if risk.get("issue", "").startswith("Avro field")
+    )
+    if avro_checked:
+        avro_summary = (
+            f"{len(avro_checked)}/{len(changed_results)} "
+            f"quer{'y' if len(changed_results) == 1 else 'ies'} checked — "
+            + (f"{avro_mismatch_count} mismatch"
+               f"{'es' if avro_mismatch_count != 1 else ''} found"
+               if avro_mismatch_count else "all fields matched")
+        )
+    else:
+        avro_summary = "N/A — no Avro-producing consumer resolved for these queries"
 
     return {
         "release_id": commit_message,
@@ -1324,7 +1767,7 @@ def build_ui_report(branch: str, commit_message: str, changed_results: list,
         "queries": queries,
         "context_verification": {
             "bq_schemas_checked": bq_schemas_checked,
-            "avro_mappings_matched": "N/A — no Avro schema in this pipeline",
+            "avro_mappings_matched": avro_summary,
             "dataflow_logic_validated": ", ".join(sorted(set(beam_filenames))) or "None",
             "vertex_cache": {
                 "status": cache_info["status"],
@@ -1362,7 +1805,7 @@ def review():
     after_sha = payload["after_sha"]
     branch = payload.get("branch", "unknown")
 
-    changed, beam_context, beam_filenames, commit_message = clone_and_diff(
+    changed, beam_context, beam_filenames, commit_message, committed_schemas = clone_and_diff(
         repo_clone_url, before_sha, after_sha
     )
     if not changed:
@@ -1381,7 +1824,8 @@ def review():
     for change in changed:
         old_bytes, _ = dry_run_bytes(change["old"]) if change["old"] else (None, True)
 
-        r, cache_info = analyze_one(change, beam_context, beam_sources, beam_index)
+        r, cache_info = analyze_one(change, beam_context, beam_sources, beam_index,
+                                    committed_schemas=committed_schemas)
         r["old_bytes"] = old_bytes
         changed_results.append(r)
 
@@ -1413,7 +1857,7 @@ def analyze():
         }), 400
     ref = payload.get("ref", "main")
 
-    all_sql, beam_context, beam_filenames, head_sha = clone_all_sql(repo_clone_url, ref)
+    all_sql, beam_context, beam_filenames, head_sha, committed_schemas = clone_all_sql(repo_clone_url, ref)
     if not all_sql:
         return flask.jsonify({"status": "no_sql_found"}), 404
 
@@ -1425,7 +1869,8 @@ def analyze():
     results, cache_info = [], None
     for change in all_sql:
         try:
-            r, cache_info = analyze_one(change, beam_context, beam_sources, beam_index)
+            r, cache_info = analyze_one(change, beam_context, beam_sources, beam_index,
+                                        committed_schemas=committed_schemas)
             results.append(r)
         except Exception:
             logger.exception(f"Analysis failed for {change['path']}, skipping")
