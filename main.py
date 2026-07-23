@@ -250,6 +250,8 @@ def _count_tables_by_dataset(changed_results):
     return counts
 
 
+_schema_manifest_cache: dict[str, str] = {}  # table ref → manifest chunk, lives for process lifetime
+
 def build_schema_manifest(sql_text: str) -> str:
     tables = _extract_tables(sql_text)
     logger.info(f"Extracted tables: {tables}")
@@ -257,6 +259,11 @@ def build_schema_manifest(sql_text: str) -> str:
 
     for table in tables:
         try:
+            if table in _schema_manifest_cache:
+                logger.info(f"Schema cache HIT for {table}")
+                manifest.append(_schema_manifest_cache[table])
+                continue
+
             parts = table.split(".")
             if len(parts) == 3:
                 project, dataset, table_name = parts
@@ -287,8 +294,8 @@ def build_schema_manifest(sql_text: str) -> str:
                 dataset_location = None
 
             column_query = f"""
-            SELECT column_name, data_type, is_partitioning_column,
-                   clustering_ordinal_position
+            SELECT column_name, data_type, is_nullable,
+                   is_partitioning_column, clustering_ordinal_position
             FROM `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
             WHERE table_name='{table_name}'
             ORDER BY ordinal_position
@@ -306,22 +313,27 @@ def build_schema_manifest(sql_text: str) -> str:
                 logger.warning(f"Could not fetch TABLE_STORAGE for {table}: {e}")
                 table_info = []
 
-            manifest.append(f"\n===== TABLE : {table} =====")
+            chunk = [f"\n===== TABLE : {table} ====="]
             if table_info:
                 t = table_info[0]
-                manifest.append(f"Rows : {t.row_count}")
-                manifest.append(f"Storage : {t.size_bytes} bytes")
+                chunk.append(f"Rows : {t.row_count}")
+                chunk.append(f"Storage : {t.size_bytes} bytes")
 
             partition_cols, clustering_cols = [], []
             for c in columns:
-                manifest.append(f"- {c.column_name} ({c.data_type})")
+                nullable_marker = " [NULLABLE]" if c.is_nullable == "YES" else ""
+                chunk.append(f"- {c.column_name} ({c.data_type}){nullable_marker}")
                 if c.is_partitioning_column == "YES":
                     partition_cols.append(c.column_name)
                 if c.clustering_ordinal_position:
                     clustering_cols.append(c.column_name)
 
-            manifest.append(f"Partition Columns : {partition_cols if partition_cols else 'None'}")
-            manifest.append(f"Cluster Columns : {clustering_cols if clustering_cols else 'None'}")
+            chunk.append(f"Partition Columns : {partition_cols if partition_cols else 'None'}")
+            chunk.append(f"Cluster Columns : {clustering_cols if clustering_cols else 'None'}")
+
+            chunk_str = "\n".join(chunk)
+            _schema_manifest_cache[table] = chunk_str
+            manifest.append(chunk_str)
 
         except Exception:
             logger.exception(f"Failed to discover schema for {table}")
@@ -1363,9 +1375,10 @@ def parse_gemini_json(rewrite: str, fallback_sql: str) -> dict:
 # and can't miss a bug because retrieval only grabbed part of a file.
 # =================================================================
 def detect_type_risks(beam_dir_context: str, consumer_file: str, schema_manifest: str) -> list:
-    """STRING-in-arithmetic detector. No LLM involved — walks the whole
-    file, so helper functions are covered too."""
+    """STRING-in-arithmetic and NULLABLE-in-arithmetic detector. No LLM
+    involved — walks the whole file, so helper functions are covered too."""
     types = dict(re.findall(r"^- (\w+) \((\w+)\)", schema_manifest, re.MULTILINE))
+    nullable_cols = set(re.findall(r"^- (\w+) \([^)]+\) \[NULLABLE\]", schema_manifest, re.MULTILINE))
 
     m = re.search(rf"--- {re.escape(consumer_file)} ---\n(.*?)(?=\n--- |\Z)",
                   beam_dir_context, re.DOTALL)
@@ -1396,6 +1409,19 @@ def detect_type_risks(beam_dir_context: str, consumer_file: str, schema_manifest
                                   f"Python does not implicitly convert {t} to a number.",
                         "fix": f"CAST({col} AS INT64/FLOAT64) in the SQL SELECT list, "
                                f"or convert in Beam before use.",
+                    })
+                elif col in nullable_cols and col not in seen:
+                    seen.add(col)
+                    risks.append({
+                        "severity": "MEDIUM",
+                        "beam_file": consumer_file,
+                        "column": col,
+                        "issue": f"{col} is NULLABLE in BigQuery but used in {kind} without a None check",
+                        "detail": f"`{ast.unparse(node)}` will raise TypeError when {col} is NULL — "
+                                  f"BigQuery returns None for NULLABLE columns and Python cannot use "
+                                  f"None in arithmetic or comparisons.",
+                        "fix": f"Guard with `if row['{col}'] is not None` before use, "
+                               f"or use `COALESCE({col}, 0)` in the SQL to guarantee a non-null value.",
                     })
 
         def visit_BinOp(self, node):
