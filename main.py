@@ -32,6 +32,7 @@ import datetime
 import logging
 import re
 import hashlib
+import time
 from collections import Counter
 
 import flask
@@ -48,6 +49,8 @@ app = flask.Flask(__name__)
 
 PROJECT_ID = os.environ["PROJECT_ID"]
 LOCATION = os.environ.get("LOCATION", "us-central1")
+
+
 BUCKET_NAME = "sql-review-ui-report"
 DEFAULT_REPO_URL = os.environ.get("DEFAULT_REPO_URL")
 BYTES_PER_GB = 1024 ** 3
@@ -1893,7 +1896,9 @@ def analyze():
     beam_index = get_function_index(beam_context, beam_sources)
 
     results, cache_info = [], None
-    for change in all_sql:
+    for i, change in enumerate(all_sql):
+        if i > 0:
+            time.sleep(10)  # avoid Gemini 429 rate limit between files
         try:
             r, cache_info = analyze_one(change, beam_context, beam_sources, beam_index,
                                         committed_schemas=committed_schemas)
