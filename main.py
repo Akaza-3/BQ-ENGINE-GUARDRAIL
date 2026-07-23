@@ -51,7 +51,7 @@ PROJECT_ID = os.environ["PROJECT_ID"]
 LOCATION = os.environ.get("LOCATION", "us-central1")
 
 
-eBUCKET_NAME = "sql-review-ui-report"
+BUCKET_NAME = "sql-review-ui-report"
 DEFAULT_REPO_URL = os.environ.get("DEFAULT_REPO_URL")
 BYTES_PER_GB = 1024 ** 3
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
