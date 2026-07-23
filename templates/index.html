@@ -486,6 +486,24 @@ function renderQueries(queries) {
       <div class="accordion-body border-t border-[#1e2836]" data-body="${q.query_id}">
         <div class="p-5 space-y-4">
 
+          <!-- Test harness (top so it's visible immediately on open) -->
+          <div class="flex items-center justify-between gap-3 rounded-lg border border-indigo-500/25 bg-indigo-500/[0.04] px-4 py-3">
+            <div class="flex items-center gap-2">
+              <i data-lucide="flask-conical" class="w-4 h-4 text-indigo-400"></i>
+              <span class="text-[11px] font-medium text-indigo-300 uppercase tracking-[0.09em]">Test data harness</span>
+              <span class="text-[11px] text-slate-500">— generate synthetic data from real BQ schema and validate</span>
+            </div>
+            <button id="testBtn-${q.query_id}"
+              onclick="runQueryTest(event, '${q.query_id}')"
+              class="shrink-0 flex items-center gap-2 px-4 py-1.5 rounded-lg bg-indigo-900/60 hover:bg-indigo-800/70 border border-indigo-700/50 text-indigo-200 text-[12px] font-medium transition active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed">
+              <i data-lucide="play" class="w-3.5 h-3.5"></i>
+              Run Tests
+            </button>
+          </div>
+          <div id="testResult-${q.query_id}" class="hidden rounded-lg border border-indigo-500/20 bg-indigo-500/[0.03] px-4 py-3">
+            <div id="testResultInner-${q.query_id}" class="text-[12px] text-slate-300"></div>
+          </div>
+
           <!-- Dry run metrics strip -->
           <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <div class="sunken rounded-lg p-3.5">
@@ -556,25 +574,6 @@ function renderQueries(queries) {
               ${getBadges(q.ai_explanation).map(badge => `
                 <span class="mono text-[10px] px-2 py-1 rounded bg-green-500/10 border border-green-500/20 text-green-400">${badge}</span>
               `).join("")}
-            </div>
-          </div>
-
-          <!-- Test harness -->
-          <div class="rounded-lg border border-indigo-500/25 bg-indigo-500/[0.04] p-4">
-            <div class="flex items-center justify-between gap-3 flex-wrap">
-              <div class="flex items-center gap-2">
-                <i data-lucide="flask-conical" class="w-4 h-4 text-indigo-400"></i>
-                <span class="text-[11px] font-medium text-indigo-400 uppercase tracking-[0.09em]">Test data harness</span>
-              </div>
-              <button id="testBtn-${q.query_id}"
-                onclick="runQueryTest(event, '${q.query_id}')"
-                class="flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-900/60 hover:bg-indigo-800/70 border border-indigo-700/50 text-indigo-200 text-[12px] font-medium transition active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed">
-                <i data-lucide="play" class="w-3.5 h-3.5"></i>
-                Run Tests
-              </button>
-            </div>
-            <div id="testResult-${q.query_id}" class="mt-3 hidden">
-              <div id="testResultInner-${q.query_id}" class="text-[12px] text-slate-300"></div>
             </div>
           </div>
 

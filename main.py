@@ -52,7 +52,7 @@ LOCATION = os.environ.get("LOCATION", "us-central1")
 
 
 BUCKET_NAME = "sql-review-ui-report"
-DEFAULT_REPO_URL = os.environ.get("DEFAULT_REPO_URL")
+sDEFAULT_REPO_URL = os.environ.get("DEFAULT_REPO_URL")
 BYTES_PER_GB = 1024 ** 3
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 if GITHUB_TOKEN:
@@ -2040,10 +2040,10 @@ REAL BIGQUERY SCHEMA (column names and types are exact — use them as-is):
 SQL QUERY TO TEST:
 {sql}
 
-Generate test cases for:
+Generate exactly 5 test cases (2 positive, 2 negative, 1 edge) — no more, no less.
   POSITIVE — rows that SHOULD appear in the final result
   NEGATIVE — rows that SHOULD be excluded
-  EDGE     — boundary values, NULLs, CAST on strings, window ties
+  EDGE     — one boundary value or NULL case
 
 Rules:
   - Use EXACT column names from the schema above
@@ -2102,8 +2102,21 @@ def _generate_test_cases(sql_text: str, schema_block: str) -> list[dict]:
     resp = genai_client.models.generate_content(
         model="gemini-2.5-flash", contents=prompt, config={"temperature": 0}
     )
-    raw = re.sub(r"^```(?:json)?|```$", "", resp.text.strip(), flags=re.MULTILINE).strip()
-    return json.loads(raw)
+    text = resp.text.strip()
+    # Strip markdown code fences if present
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+    # Extract the first JSON array or object from the response
+    m = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", raw)
+    if not m:
+        raise ValueError(f"Gemini returned no JSON. Response: {text[:500]}")
+    parsed = json.loads(m.group(1))
+    # Handle both bare array and wrapped object {"test_cases": [...]}
+    if isinstance(parsed, dict):
+        for key in ("test_cases", "cases", "tests", "results"):
+            if key in parsed and isinstance(parsed[key], list):
+                return parsed[key]
+        raise ValueError(f"Gemini returned a JSON object but no list key found. Keys: {list(parsed.keys())}")
+    return parsed
 
 
 def _create_test_table(table_ref: str, schema: dict[str, str]) -> str:
@@ -2290,16 +2303,19 @@ def run_tests():
 
     try:
         # Step 1: fetch real schema via the same function the guardrail uses
+        logger.info(f"[TEST] Step 1: building schema manifest for {sql_path}")
         manifest = build_schema_manifest(sql_text)
         schemas = _parse_manifest_to_schema(manifest)
         if not schemas:
             return flask.jsonify({"status": "error",
                                   "message": "No tables found in manifest"}), 400
+        logger.info(f"[TEST] Step 1 done: {len(schemas)} table(s): {list(schemas.keys())}")
         schema_block = _schema_to_block(schemas)
 
         # Step 2: ask Gemini to generate test cases from the real schema
+        logger.info(f"[TEST] Step 2: calling Gemini for test case generation")
         test_cases = _generate_test_cases(sql_text, schema_block)
-        logger.info(f"Generated {len(test_cases)} test cases for {sql_path}")
+        logger.info(f"[TEST] Step 2 done: {len(test_cases)} test case(s) for {sql_path}")
 
         if dry_run:
             return flask.jsonify({
@@ -2311,14 +2327,27 @@ def run_tests():
             })
 
         # Step 3: create test tables mirroring real schema
+        logger.info(f"[TEST] Step 3: setting up test tables in {TEST_DATASET}")
         table_mapping = _setup_test_tables(schemas)
+        logger.info(f"[TEST] Step 3 done: table_mapping={table_mapping}")
 
         # Step 4: load synthetic rows
+        logger.info(f"[TEST] Step 4: loading test data")
         _load_test_data(test_cases, table_mapping)
+        logger.info(f"[TEST] Step 4 done")
 
-        # Step 5: rewrite SQL to point at test dataset and run it
+        # Step 5: rewrite SQL to point at test dataset and run it.
+        # Streaming inserts have eventual consistency — poll until rows
+        # appear or give up after 30s rather than sleeping a fixed 5s.
         test_sql = _rewrite_to_test_dataset(sql_text)
-        time.sleep(5)   # allow streaming inserts to settle
+        first_table_id = next(iter(table_mapping.values()))
+        for _ in range(6):
+            time.sleep(3)
+            probe = list(bq_client.query(
+                f"SELECT COUNT(*) as n FROM `{first_table_id}`"
+            ).result())
+            if probe and probe[0].n > 0:
+                break
         actual_rows = [dict(r) for r in bq_client.query(test_sql).result()]
         logger.info(f"Test query returned {len(actual_rows)} row(s)")
 
@@ -2341,10 +2370,10 @@ def run_tests():
             "report_gcs_path": report_gcs_path,
         })
 
-    except Exception:
+    except Exception as _te:
         logger.exception(f"Test harness failed for {sql_path}")
         return flask.jsonify({"status": "error",
-                              "message": "Test harness failed — check logs"}), 500
+                              "message": f"Test harness failed: {_te}"}), 500
 
 
 @app.route("/api/latest-report", methods=["GET"])
