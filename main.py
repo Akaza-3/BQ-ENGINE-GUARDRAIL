@@ -1396,17 +1396,13 @@ def detect_type_risks(beam_dir_context: str, consumer_file: str, schema_manifest
     types = dict(re.findall(r"^- (\w+) \((\w+)\)", schema_manifest, re.MULTILINE))
     nullable_cols = set(re.findall(r"^- (\w+) \([^)]+\) \[NULLABLE\]", schema_manifest, re.MULTILINE))
 
-    # Scan ALL Beam files, not just the consumer — helper functions in
-    # sibling files that also touch row["col"] are covered this way.
-    # We tag each risk with the file it was found in.
-    file_blocks = re.findall(
-        r"--- (.+?) ---\n(.*?)(?=\n--- |\Z)", beam_dir_context, re.DOTALL
-    )
-    if not file_blocks:
-        # Fallback: try single-file pattern (consumer file only)
-        m = re.search(rf"--- {re.escape(consumer_file)} ---\n(.*?)(?=\n--- |\Z)",
-                      beam_dir_context, re.DOTALL)
-        file_blocks = [(consumer_file, m.group(1))] if m else []
+    # Scan only the resolved consumer file — scanning all Beam files causes
+    # risks from unrelated consumers to appear on every query.
+    m = re.search(rf"--- {re.escape(consumer_file)} ---\n(.*?)(?=\n--- |\Z)",
+                  beam_dir_context, re.DOTALL)
+    if not m:
+        return []
+    file_blocks = [(consumer_file, m.group(1))]
 
     risks, seen = [], set()
     NUMERIC_CONVERSIONS = {"int", "float", "round", "abs", "divmod", "pow"}
