@@ -42,7 +42,7 @@
     transition: max-height 420ms cubic-bezier(0.4, 0, 0.2, 1), opacity 260ms ease;
     opacity: 0;
   }
-  .accordion-body.open { max-height: 3600px; opacity: 1; }
+  .accordion-body.open { max-height: none; overflow: visible; opacity: 1; }
   .chev { transition: transform 280ms cubic-bezier(0.4, 0, 0.2, 1); }
   .chev.open { transform: rotate(180deg); }
   .bar-fill { transition: width 900ms cubic-bezier(0.22, 1, 0.36, 1); }
